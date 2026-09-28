@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <title>Backend Upload Test</title>
+</head>
+
+<body>
+
+  <h2>Japan Job System - Photo Upload Test</h2>
+
+  <input
+    type="file"
+    id="imageInput"
+    accept="image/*"
+  />
+
+  <br /><br />
+
+  <button id="uploadButton">
+    Upload Photo
+  </button>
+
+  <br /><br />
+
+  <div id="result"></div>
+
+  <script>
+
+    const imageInput =
+      document.getElementById("imageInput");
+
+    const uploadButton =
+      document.getElementById("uploadButton");
+
+    const result =
+      document.getElementById("result");
+
+
+    uploadButton.addEventListener(
+      "click",
+      async () => {
+
+        const file =
+          imageInput.files[0];
+
+        if (!file) {
+
+          result.innerText =
+            "Please select an image.";
+
+          return;
+        }
+
+
+        const formData =
+          new FormData();
+
+        formData.append(
+          "image",
+          file
+        );
+
+
+        result.innerText =
+          "Uploading...";
+
+
+        try {
+
+          const response =
+            await fetch(
+              "http://localhost:5000/api/upload",
+              {
+                method: "POST",
+                body: formData,
+              }
+            );
+
+
+          const data =
+            await response.json();
+
+
+          console.log(data);
+
+
+          if (!data.success) {
+
+            result.innerText =
+              data.message ||
+              "Upload failed.";
+
+            return;
+          }
+
+
+          result.innerHTML = `
+
+            <p>
+              Upload successful!
+            </p>
+
+            <p>
+              File:
+              ${data.filename}
+            </p>
+
+            <p>
+              Size:
+              ${data.size} bytes
+            </p>
+
+            <img
+              src="${data.url}"
+              style="
+                width: 250px;
+                height: auto;
+                margin-top: 20px;
+              "
+            />
+
+          `;
+
+        } catch (error) {
+
+          console.error(error);
+
+          result.innerText =
+            "Cannot connect to backend.";
+
+        }
+
+      }
+    );
+
+  </script>
+
+</body>
+</html>
