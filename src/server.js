@@ -5,12 +5,22 @@ import multer from "multer";
 import path from "path";
 import { fileURLToPath } from "url";
 import fs from "fs";
+import { createClient } from "@supabase/supabase-js";
 
 dotenv.config();
 
 const app = express();
 
 const PORT = process.env.PORT || 5000;
+
+// --------------------------------------------------
+// Supabase
+// --------------------------------------------------
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SECRET_KEY
+);
 
 // --------------------------------------------------
 // ES Module __dirname
@@ -20,7 +30,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // --------------------------------------------------
-// Upload folder
+// Temporary Upload Folder
 // --------------------------------------------------
 
 const uploadDir = path.join(
@@ -64,6 +74,7 @@ const storage = multer.diskStorage({
 // --------------------------------------------------
 
 const upload = multer({
+
   storage,
 
   limits: {
@@ -75,16 +86,21 @@ const upload = multer({
     if (
       file.mimetype.startsWith("image/")
     ) {
+
       cb(null, true);
+
     } else {
+
       cb(
         new Error(
           "Only image files are allowed."
         )
       );
+
     }
 
   },
+
 });
 
 // --------------------------------------------------
@@ -95,16 +111,20 @@ app.use(cors());
 
 app.use(express.json());
 
+// Temporary local uploads
 app.use(
   "/uploads",
   express.static(uploadDir)
 );
+
+// Test page
 app.use(
   "/test",
   express.static(
     path.join(__dirname, "../")
   )
 );
+
 // --------------------------------------------------
 // Health Check
 // --------------------------------------------------
@@ -114,9 +134,12 @@ app.get(
   (req, res) => {
 
     res.json({
+
       success: true,
+
       message:
         "Japan Job System Backend is running!",
+
     });
 
   }
@@ -129,22 +152,115 @@ app.get(
 app.post(
   "/api/upload",
   upload.single("image"),
-  (req, res) => {
+  async (req, res) => {
 
     try {
 
       if (!req.file) {
 
         return res.status(400).json({
+
           success: false,
-          message: "No image uploaded.",
+
+          message:
+            "No image uploaded.",
+
         });
 
       }
 
-     const imageUrl =
-  `https://japan-job-system-backend-production.up.railway.app/uploads/${req.file.filename}`;
+      // --------------------------------------------------
+      // Read uploaded image
+      // --------------------------------------------------
+
+      const fileBuffer =
+        fs.readFileSync(
+          req.file.path
+        );
+
+      // --------------------------------------------------
+      // Upload image to Supabase Storage
+      // --------------------------------------------------
+
+      const {
+        error: uploadError,
+      } =
+        await supabase.storage
+          .from("student-photos")
+          .upload(
+            req.file.filename,
+            fileBuffer,
+            {
+              contentType:
+                req.file.mimetype,
+
+              upsert: true,
+            }
+          );
+
+      // --------------------------------------------------
+      // Supabase upload error
+      // --------------------------------------------------
+
+      if (uploadError) {
+
+        console.error(
+          "Supabase upload error:",
+          uploadError
+        );
+
+        return res.status(500).json({
+
+          success: false,
+
+          message:
+            "Failed to upload image to Supabase.",
+
+        });
+
+      }
+
+      // --------------------------------------------------
+      // Get public URL
+      // --------------------------------------------------
+
+      const {
+        data: publicUrlData,
+      } =
+        supabase.storage
+          .from("student-photos")
+          .getPublicUrl(
+            req.file.filename
+          );
+
+      const imageUrl =
+        publicUrlData.publicUrl;
+
+      // --------------------------------------------------
+      // Delete temporary local file
+      // --------------------------------------------------
+
+      try {
+
+        fs.unlinkSync(
+          req.file.path
+        );
+
+      } catch (deleteError) {
+
+        console.error(
+          "Temporary file delete error:",
+          deleteError
+        );
+
+      }
+
+      // --------------------------------------------------
+      // Response
+      // --------------------------------------------------
+
       res.json({
+
         success: true,
 
         message:
@@ -161,6 +277,7 @@ app.post(
 
         url:
           imageUrl,
+
       });
 
     } catch (error) {
@@ -171,9 +288,13 @@ app.post(
       );
 
       res.status(500).json({
+
         success: false,
+
         message:
+          error.message ||
           "Image upload failed.",
+
       });
 
     }
@@ -200,9 +321,12 @@ app.use(
       ) {
 
         return res.status(400).json({
+
           success: false,
+
           message:
             "Image size must be 20MB or less.",
+
         });
 
       }
@@ -210,10 +334,13 @@ app.use(
     }
 
     res.status(500).json({
+
       success: false,
+
       message:
         error.message ||
         "Server error.",
+
     });
 
   }
