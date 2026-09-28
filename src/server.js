@@ -142,9 +142,8 @@ app.post(
 
       }
 
-      const imageUrl =
-        `http://localhost:${PORT}/uploads/${req.file.filename}`;
-
+     const imageUrl =
+  `https://japan-job-system-backend-production.up.railway.app/uploads/${req.file.filename}`;
       res.json({
         success: true,
 
