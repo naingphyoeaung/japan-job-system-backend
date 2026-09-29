@@ -1,3 +1,53 @@
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import { createClient } from "@supabase/supabase-js";
+
+dotenv.config();
+
+const app = express();
+
+const PORT = process.env.PORT || 8080;
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SECRET_KEY =
+  process.env.SUPABASE_SECRET_KEY;
+
+if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
+  console.error(
+    "❌ Missing SUPABASE_URL or SUPABASE_SECRET_KEY in environment variables."
+  );
+  process.exit(1);
+}
+
+const supabase = createClient(
+  SUPABASE_URL,
+  SUPABASE_SECRET_KEY
+);
+
+// --------------------------------------------------
+// Middleware
+// --------------------------------------------------
+
+app.use(
+  cors({
+    origin: "*",
+  })
+);
+
+app.use(express.json({ limit: "20mb" }));
+
+// --------------------------------------------------
+// Health Check
+// --------------------------------------------------
+
+app.get("/", (req, res) => {
+  res.json({
+    success: true,
+    message: "Japan Job System Backend is running.",
+  });
+});
+
 // --------------------------------------------------
 // Image Delete API
 // --------------------------------------------------
@@ -5,23 +55,22 @@
 app.post(
   "/api/delete-images",
   async (req, res) => {
-
     try {
-
       const {
         urls = [],
       } = req.body;
 
       if (!Array.isArray(urls)) {
-
         return res.status(400).json({
           success: false,
           message: "urls must be an array.",
         });
-
       }
 
+      // --------------------------------------------------
       // Remove empty / invalid values
+      // --------------------------------------------------
+
       const validUrls = urls.filter(
         (url) =>
           typeof url === "string" &&
@@ -29,24 +78,21 @@ app.post(
       );
 
       if (validUrls.length === 0) {
-
         return res.json({
           success: true,
           message: "No images to delete.",
           deleted: [],
         });
-
       }
 
       // --------------------------------------------------
-      // Convert Supabase public URLs → storage filenames
+      // Convert Supabase public URLs
+      // → storage filenames
       // --------------------------------------------------
 
       const fileNames = validUrls
         .map((url) => {
-
           try {
-
             const parsedUrl =
               new URL(url);
 
@@ -67,9 +113,7 @@ app.post(
                 index + marker.length
               )
             );
-
           } catch (error) {
-
             console.error(
               "Invalid image URL:",
               url
@@ -77,21 +121,15 @@ app.post(
 
             return null;
           }
-
         })
         .filter(Boolean);
 
       if (fileNames.length === 0) {
-
         return res.status(400).json({
-
           success: false,
-
           message:
             "No valid Supabase student photo URLs found.",
-
         });
-
       }
 
       // --------------------------------------------------
@@ -107,24 +145,17 @@ app.post(
           .remove(fileNames);
 
       if (error) {
-
         console.error(
-          "Supabase image delete error:",
+          "❌ Supabase image delete error:",
           error
         );
 
         return res.status(500).json({
-
           success: false,
-
           message:
             "Failed to delete image(s) from Supabase.",
-
-          error:
-            error.message,
-
+          error: error.message,
         });
-
       }
 
       // --------------------------------------------------
@@ -132,36 +163,25 @@ app.post(
       // --------------------------------------------------
 
       return res.json({
-
         success: true,
-
         message:
           "Image(s) deleted successfully.",
-
-        deleted:
-          data || [],
-
+        deleted: data || [],
       });
 
     } catch (error) {
-
       console.error(
-        "Delete images error:",
+        "❌ Delete images error:",
         error
       );
 
       return res.status(500).json({
-
         success: false,
-
         message:
           error.message ||
           "Image deletion failed.",
-
       });
-
     }
-
   }
 );
 
@@ -172,9 +192,7 @@ app.post(
 app.get(
   "/api/student-photo",
   async (req, res) => {
-
     try {
-
       const {
         url = "",
       } = req.query;
@@ -183,35 +201,39 @@ app.get(
         typeof url !== "string" ||
         url.trim() === ""
       ) {
-
         return res.status(400).json({
           success: false,
-          message: "Image URL is required.",
+          message:
+            "Image URL is required.",
         });
-
       }
 
       // --------------------------------------------------
-      // Convert Supabase public URL → storage filename
+      // Validate Supabase public URL
       // --------------------------------------------------
 
-      const parsedUrl = new URL(url);
+      const parsedUrl =
+        new URL(url);
 
       const marker =
         "/storage/v1/object/public/student-photos/";
 
       const index =
-        parsedUrl.pathname.indexOf(marker);
+        parsedUrl.pathname.indexOf(
+          marker
+        );
 
       if (index === -1) {
-
         return res.status(400).json({
           success: false,
           message:
             "Invalid student photo URL.",
         });
-
       }
+
+      // --------------------------------------------------
+      // Get storage filename
+      // --------------------------------------------------
 
       const fileName =
         decodeURIComponent(
@@ -221,13 +243,11 @@ app.get(
         );
 
       if (!fileName) {
-
         return res.status(400).json({
           success: false,
           message:
             "Student photo filename is missing.",
         });
-
       }
 
       console.log(
@@ -241,14 +261,13 @@ app.get(
 
       const {
         data,
-        error
+        error,
       } =
         await supabase.storage
           .from("student-photos")
           .download(fileName);
 
       if (error) {
-
         console.error(
           "❌ Supabase image download error:",
           error
@@ -261,17 +280,14 @@ app.get(
           error:
             error.message,
         });
-
       }
 
       if (!data) {
-
         return res.status(404).json({
           success: false,
           message:
             "Student photo is empty.",
         });
-
       }
 
       // --------------------------------------------------
@@ -302,7 +318,7 @@ app.get(
       );
 
       // --------------------------------------------------
-      // Response headers
+      // Response Headers
       // --------------------------------------------------
 
       res.setHeader(
@@ -327,23 +343,31 @@ app.get(
       return res.send(buffer);
 
     } catch (error) {
-
       console.error(
         "❌ Image proxy error:",
         error
       );
 
       return res.status(500).json({
-
         success: false,
-
         message:
           error.message ||
           "Failed to load student photo.",
-
       });
-
     }
+  }
+);
 
+// --------------------------------------------------
+// Start Server
+// --------------------------------------------------
+
+app.listen(
+  PORT,
+  "0.0.0.0",
+  () => {
+    console.log(
+      `🚀 Backend server running on port ${PORT}`
+    );
   }
 );
