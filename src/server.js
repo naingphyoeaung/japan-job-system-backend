@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import multer from "multer";
 import { createClient } from "@supabase/supabase-js";
 
 dotenv.config();
@@ -35,7 +36,22 @@ app.use(
   })
 );
 
-app.use(express.json({ limit: "20mb" }));
+app.use(
+  express.json({
+    limit: "20mb",
+  })
+);
+
+// --------------------------------------------------
+// Multer
+// --------------------------------------------------
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 5 * 1024 * 1024,
+  },
+});
 
 // --------------------------------------------------
 // Health Check
@@ -47,6 +63,170 @@ app.get("/", (req, res) => {
     message: "Japan Job System Backend is running.",
   });
 });
+
+// --------------------------------------------------
+// Image Upload API
+// --------------------------------------------------
+
+app.post(
+  "/api/upload",
+  upload.single("image"),
+  async (req, res) => {
+    try {
+      // --------------------------------------------------
+      // Check uploaded file
+      // --------------------------------------------------
+
+      if (!req.file) {
+        return res.status(400).json({
+          success: false,
+          message: "No image file received.",
+        });
+      }
+
+      console.log(
+        "================================="
+      );
+
+      console.log(
+        "📤 Uploading image to Supabase..."
+      );
+
+      console.log(
+        "Filename:",
+        req.file.originalname
+      );
+
+      console.log(
+        "Mimetype:",
+        req.file.mimetype
+      );
+
+      console.log(
+        "Size:",
+        req.file.size
+      );
+
+      // --------------------------------------------------
+      // Generate unique filename
+      // --------------------------------------------------
+
+      const extension =
+        req.file.mimetype === "image/png"
+          ? "png"
+          : req.file.mimetype === "image/webp"
+          ? "webp"
+          : "jpg";
+
+      const fileName = `${Date.now()}-${Math.floor(
+        Math.random() * 1000000000
+      )}.${extension}`;
+
+      console.log(
+        "Supabase filename:",
+        fileName
+      );
+
+      // --------------------------------------------------
+      // Upload to Supabase Storage
+      // --------------------------------------------------
+
+      const {
+        data,
+        error,
+      } =
+        await supabase.storage
+          .from("student-photos")
+          .upload(
+            fileName,
+            req.file.buffer,
+            {
+              contentType:
+                req.file.mimetype,
+              upsert: false,
+            }
+          );
+
+      if (error) {
+        console.error(
+          "❌ Supabase upload error:",
+          error
+        );
+
+        return res.status(500).json({
+          success: false,
+          message:
+            "Failed to upload image to Supabase.",
+          error: error.message,
+        });
+      }
+
+      console.log(
+        "✅ Supabase upload successful:",
+        data
+      );
+
+      // --------------------------------------------------
+      // Create Public URL
+      // --------------------------------------------------
+
+      const {
+        data: publicUrlData,
+      } =
+        supabase.storage
+          .from("student-photos")
+          .getPublicUrl(fileName);
+
+      const publicUrl =
+        publicUrlData?.publicUrl || "";
+
+      if (!publicUrl) {
+        console.error(
+          "❌ Failed to create Supabase public URL."
+        );
+
+        return res.status(500).json({
+          success: false,
+          message:
+            "Image uploaded but public URL could not be created.",
+        });
+      }
+
+      console.log(
+        "✅ Public image URL:",
+        publicUrl
+      );
+
+      console.log(
+        "================================="
+      );
+
+      // --------------------------------------------------
+      // Response
+      // --------------------------------------------------
+
+      return res.status(200).json({
+        success: true,
+        message:
+          "Image uploaded successfully.",
+        url: publicUrl,
+        fileName,
+      });
+    } catch (error) {
+      console.error(
+        "❌ Upload image error:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          error.message ||
+          "Image upload failed.",
+      });
+    }
+  }
+);
 
 // --------------------------------------------------
 // Image Delete API
@@ -132,6 +312,11 @@ app.post(
         });
       }
 
+      console.log(
+        "🗑️ Deleting Supabase files:",
+        fileNames
+      );
+
       // --------------------------------------------------
       // Delete from Supabase Storage
       // --------------------------------------------------
@@ -168,7 +353,6 @@ app.post(
           "Image(s) deleted successfully.",
         deleted: data || [],
       });
-
     } catch (error) {
       console.error(
         "❌ Delete images error:",
@@ -341,7 +525,6 @@ app.get(
       // --------------------------------------------------
 
       return res.send(buffer);
-
     } catch (error) {
       console.error(
         "❌ Image proxy error:",
