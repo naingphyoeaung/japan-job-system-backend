@@ -1,4 +1,3 @@
-
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -117,7 +116,6 @@ const upload = multer({
   limits: {
     fileSize: 10 * 1024 * 1024,
   },
-});
   fileFilter: (req, file, callback) => {
     const allowedTypes = [
       "image/jpeg",
@@ -136,7 +134,6 @@ const upload = multer({
     callback(null, true);
   },
 });
-
 // --------------------------------------------------
 // Shared helpers
 // --------------------------------------------------
