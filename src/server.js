@@ -652,7 +652,7 @@ app.use((error, req, res, next) => {
   if (error instanceof multer.MulterError) {
     const message =
       error.code === "LIMIT_FILE_SIZE"
-        ? "Image must be 5MB or smaller."
+        ? "Image must be 10MB or smaller."
         : error.message;
 
     return res.status(400).json({
