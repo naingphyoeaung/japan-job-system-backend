@@ -1,18 +1,29 @@
+
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import multer from "multer";
-import { randomUUID } from "node:crypto";
+import {
+  randomUUID,
+  createHmac,
+  timingSafeEqual,
+} from "node:crypto";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { createClient } from "@supabase/supabase-js";
+
 import {
   initializeApp,
   cert,
   getApps,
 } from "firebase-admin/app";
+
 import {
   getFirestore,
   FieldValue,
 } from "firebase-admin/firestore";
+
+import { getAuth } from "firebase-admin/auth";
 
 dotenv.config();
 
@@ -21,6 +32,12 @@ const PORT = process.env.PORT || 8080;
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
+const IMAGE_CLEANUP_SECRET = process.env.IMAGE_CLEANUP_SECRET;
+
+const ALLOWED_IMAGE_BUCKETS = [
+  "student-photos",
+  "job-student-photos",
+];
 
 // --------------------------------------------------
 // Supabase
@@ -52,50 +69,83 @@ const supabase = createClient(
 // --------------------------------------------------
 
 let firestore = null;
+let firebaseAdminReady = false;
 
 const firebaseProjectId = process.env.FIREBASE_PROJECT_ID;
 const firebaseClientEmail = process.env.FIREBASE_CLIENT_EMAIL;
 const firebasePrivateKey = process.env.FIREBASE_PRIVATE_KEY;
 
-console.log("Firebase env check:", {
-  projectIdExists: Boolean(firebaseProjectId),
-  clientEmailExists: Boolean(firebaseClientEmail),
-  privateKeyExists: Boolean(firebasePrivateKey),
-});
+try {
+  let credential = null;
 
-if (
-  firebaseProjectId &&
-  firebaseClientEmail &&
-  firebasePrivateKey
-) {
-  try {
-    const firebaseApp =
-      getApps().length > 0
-        ? getApps()[0]
-        : initializeApp({
-            credential: cert({
-              projectId: firebaseProjectId,
-              clientEmail: firebaseClientEmail,
-              privateKey: firebasePrivateKey
-  .trim()
-  .replace(/^["']|["']$/g, "")
-  .replace(/\\n/g, "\n"),
-            }),
-          });
+  const localServiceAccountPath = process.env.USERPROFILE
+    ? path.join(
+        process.env.USERPROFILE,
+        "Downloads",
+        "japan-job-system-6bf5b944098e.json"
+      )
+    : null;
 
-    firestore = getFirestore(firebaseApp);
+  if (localServiceAccountPath) {
+    try {
+      const serviceAccount = JSON.parse(
+        readFileSync(localServiceAccountPath, "utf8")
+      );
 
-    console.log("Firebase Admin initialized.");
-  } catch (error) {
-    console.error(
-      "Firebase Admin initialization failed:",
-      error.message
-    );
+      if (serviceAccount.project_id !== "japan-job-system") {
+        throw new Error("Unexpected Firebase project ID.");
+      }
+
+      credential = cert(serviceAccount);
+
+      console.log(
+        "Using local Firebase service account JSON."
+      );
+    } catch (error) {
+      if (error.code !== "ENOENT") {
+        throw error;
+      }
+    }
   }
-} else {
-  console.warn(
-    "Firebase Admin credentials are missing. " +
-      "Registration API will return 503."
+
+  if (!credential) {
+    if (
+      !firebaseProjectId ||
+      !firebaseClientEmail ||
+      !firebasePrivateKey
+    ) {
+      throw new Error(
+        "Firebase environment credentials are missing."
+      );
+    }
+
+    const normalizedPrivateKey = firebasePrivateKey
+      .replace(/\\n/g, "\n")
+      .replace(/^["']|["']$/g, "")
+      .trim();
+
+    credential = cert({
+      projectId: firebaseProjectId,
+      clientEmail: firebaseClientEmail,
+      privateKey: normalizedPrivateKey,
+    });
+  }
+
+  const firebaseApp =
+    getApps().length > 0
+      ? getApps()[0]
+      : initializeApp({
+          credential,
+        });
+
+  firestore = getFirestore(firebaseApp);
+  firebaseAdminReady = true;
+
+  console.log("Firebase Admin initialized.");
+} catch (error) {
+  console.error(
+    "Firebase Admin initialization failed:",
+    error.message
   );
 }
 
@@ -104,18 +154,86 @@ if (
 // --------------------------------------------------
 
 app.use(cors({ origin: "*" }));
-
 app.use(express.json({ limit: "20mb" }));
 
 // --------------------------------------------------
-// Multer
+// Firebase Authentication & Authorization
+// --------------------------------------------------
+
+async function verifyFirebaseToken(req, res, next) {
+  try {
+    if (!firebaseAdminReady || getApps().length === 0) {
+      return res.status(503).json({
+        success: false,
+        message: "Authentication service is unavailable.",
+      });
+    }
+
+    const authorization = req.headers.authorization || "";
+    const match = authorization.match(/^Bearer (.+)$/i);
+
+    if (!match) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication token is required.",
+      });
+    }
+
+    const decodedToken = await getAuth().verifyIdToken(
+      match[1]
+    );
+
+    req.authUser = decodedToken;
+
+    return next();
+  } catch (error) {
+    console.error(
+      "Authentication failed:",
+      error.code || error.name
+    );
+
+    return res.status(401).json({
+      success: false,
+      message: "Invalid or expired authentication token.",
+    });
+  }
+}
+
+function requireAdmin(req, res, next) {
+  if (req.authUser?.role !== "admin") {
+    return res.status(403).json({
+      success: false,
+      message: "Admin permission is required.",
+    });
+  }
+
+  return next();
+}
+
+function requireAdminOrTeacher(req, res, next) {
+  const role = req.authUser?.role;
+
+  if (role !== "admin" && role !== "teacher") {
+    return res.status(403).json({
+      success: false,
+      message: "Admin or Teacher permission is required.",
+    });
+  }
+
+  return next();
+}
+
+// --------------------------------------------------
+// Multer image upload configuration
 // --------------------------------------------------
 
 const upload = multer({
   storage: multer.memoryStorage(),
+
   limits: {
     fileSize: 10 * 1024 * 1024,
   },
+
   fileFilter: (req, file, callback) => {
     const allowedTypes = [
       "image/jpeg",
@@ -134,8 +252,9 @@ const upload = multer({
     callback(null, true);
   },
 });
+
 // --------------------------------------------------
-// Shared helpers
+// Shared image helpers
 // --------------------------------------------------
 
 function createImageName(file) {
@@ -146,11 +265,198 @@ function createImageName(file) {
       ? "webp"
       : "jpg";
 
-  return `${Date.now()}-${randomUUID()}.${extension}`;
+  return `${randomUUID()}-${Date.now()}.${extension}`;
 }
+
+function createCleanupToken(bucket, filePath) {
+  if (!IMAGE_CLEANUP_SECRET) {
+    throw new Error(
+      "IMAGE_CLEANUP_SECRET is not configured."
+    );
+  }
+
+  if (!ALLOWED_IMAGE_BUCKETS.includes(bucket)) {
+    throw new Error("Unsupported image bucket.");
+  }
+
+  const expiresAt = Date.now() + 30 * 60 * 1000;
+
+  const payload = Buffer.from(
+    JSON.stringify({
+      bucket,
+      filePath,
+      expiresAt,
+    })
+  ).toString("base64url");
+
+  const signature = createHmac(
+    "sha256",
+    IMAGE_CLEANUP_SECRET
+  )
+    .update(payload)
+    .digest("base64url");
+
+  return `${payload}.${signature}`;
+}
+
+function verifyCleanupToken(token) {
+  if (
+    !IMAGE_CLEANUP_SECRET ||
+    typeof token !== "string"
+  ) {
+    return null;
+  }
+
+  const parts = token.split(".");
+
+  if (parts.length !== 2) {
+    return null;
+  }
+
+  const [payload, signature] = parts;
+
+  const expectedSignature = createHmac(
+    "sha256",
+    IMAGE_CLEANUP_SECRET
+  )
+    .update(payload)
+    .digest();
+
+  let actualSignature;
+
+  try {
+    actualSignature = Buffer.from(
+      signature,
+      "base64url"
+    );
+  } catch {
+    return null;
+  }
+
+  if (
+    actualSignature.length !== expectedSignature.length ||
+    !timingSafeEqual(
+      actualSignature,
+      expectedSignature
+    )
+  ) {
+    return null;
+  }
+
+  try {
+    const decoded = JSON.parse(
+      Buffer.from(payload, "base64url").toString("utf8")
+    );
+
+    if (
+      !ALLOWED_IMAGE_BUCKETS.includes(decoded.bucket) ||
+      typeof decoded.filePath !== "string" ||
+      !decoded.filePath ||
+      decoded.filePath.startsWith("/") ||
+      decoded.filePath.split("/").some(
+        (part) => part === "." || part === ".."
+      ) ||
+      !Number.isFinite(decoded.expiresAt) ||
+      decoded.expiresAt <= Date.now()
+    ) {
+      return null;
+    }
+
+    return decoded;
+  } catch {
+    return null;
+  }
+}
+
+async function uploadImageToSupabase(
+  bucket,
+  file,
+  folder = ""
+) {
+  const filename = createImageName(file);
+
+  const storagePath = folder
+    ? `${folder}/${filename}`
+    : filename;
+
+  const { error } = await supabase.storage
+    .from(bucket)
+    .upload(storagePath, file.buffer, {
+      contentType: file.mimetype,
+      upsert: false,
+    });
+
+  if (error) {
+    throw error;
+  }
+
+  const { data } = supabase.storage
+    .from(bucket)
+    .getPublicUrl(storagePath);
+
+  return {
+    path: storagePath,
+    url: data.publicUrl,
+    bucket,
+  };
+}
+
+async function deleteImagesFromSupabase(
+  bucket,
+  imageUrls
+) {
+  if (
+    !ALLOWED_IMAGE_BUCKETS.includes(bucket) ||
+    !Array.isArray(imageUrls) ||
+    imageUrls.length === 0
+  ) {
+    return;
+  }
+
+  const paths = imageUrls
+    .filter((url) => typeof url === "string")
+    .map((url) => getStorageFileName(url, bucket))
+    .filter(Boolean);
+
+  const uniquePaths = [...new Set(paths)];
+
+  if (uniquePaths.length === 0) {
+    return;
+  }
+
+  const { error } = await supabase.storage
+    .from(bucket)
+    .remove(uniquePaths);
+
+  if (error) {
+    throw error;
+  }
+}
+
+// --------------------------------------------------
+// Health check
+// --------------------------------------------------
+
+app.get("/", (req, res) => {
+  return res.status(200).json({
+    success: true,
+    message: "Japan Job System backend is running.",
+  });
+});
+
+// --------------------------------------------------
+// Storage URL validation
+// --------------------------------------------------
 
 function getStorageFileName(url, bucket) {
   try {
+    if (
+      typeof url !== "string" ||
+      !ALLOWED_IMAGE_BUCKETS.includes(bucket)
+    ) {
+      return null;
+    }
+
     const parsedUrl = new URL(url);
 
     if (parsedUrl.origin !== supabaseOrigin) {
@@ -165,8 +471,7 @@ function getStorageFileName(url, bucket) {
     }
 
     const encodedName = parsedUrl.pathname.slice(
-      parsedUrl.pathname.indexOf(marker) +
-        marker.length
+      parsedUrl.pathname.indexOf(marker) + marker.length
     );
 
     const fileName = decodeURIComponent(encodedName);
@@ -187,12 +492,32 @@ function getStorageFileName(url, bucket) {
   }
 }
 
+// --------------------------------------------------
+// Image upload API handler
+// --------------------------------------------------
+
 async function uploadImage(req, res, bucket, label) {
+  let uploadedPath = null;
+
   try {
     if (!req.file) {
       return res.status(400).json({
         success: false,
         message: "No image file received.",
+      });
+    }
+
+    if (!ALLOWED_IMAGE_BUCKETS.includes(bucket)) {
+      return res.status(400).json({
+        success: false,
+        message: "Unsupported image bucket.",
+      });
+    }
+
+    if (!IMAGE_CLEANUP_SECRET) {
+      return res.status(503).json({
+        success: false,
+        message: "Image cleanup is not configured.",
       });
     }
 
@@ -214,29 +539,52 @@ async function uploadImage(req, res, bucket, label) {
       });
     }
 
+    uploadedPath = data?.path || fileName;
+
     const { data: publicUrlData } = supabase.storage
       .from(bucket)
-      .getPublicUrl(data?.path || fileName);
+      .getPublicUrl(uploadedPath);
 
     const publicUrl = publicUrlData?.publicUrl || "";
 
     if (!publicUrl) {
+      await supabase.storage
+        .from(bucket)
+        .remove([uploadedPath]);
+
       return res.status(500).json({
         success: false,
         message: "Could not create public image URL.",
       });
     }
 
-    console.log(`${label} upload successful.`);
+    const cleanupToken = createCleanupToken(
+      bucket,
+      uploadedPath
+    );
 
     return res.status(200).json({
       success: true,
       message: "Image uploaded successfully.",
       url: publicUrl,
-      fileName: data?.path || fileName,
+      fileName: uploadedPath,
+      cleanupToken,
     });
   } catch (error) {
     console.error(`${label} upload error:`, error);
+
+    if (uploadedPath) {
+      try {
+        await supabase.storage
+          .from(bucket)
+          .remove([uploadedPath]);
+      } catch (cleanupError) {
+        console.error(
+          `${label} upload rollback failed:`,
+          cleanupError.message
+        );
+      }
+    }
 
     return res.status(500).json({
       success: false,
@@ -244,6 +592,10 @@ async function uploadImage(req, res, bucket, label) {
     });
   }
 }
+
+// --------------------------------------------------
+// Authenticated image deletion handler
+// --------------------------------------------------
 
 async function deleteImages(req, res, bucket, label) {
   try {
@@ -304,6 +656,100 @@ async function deleteImages(req, res, bucket, label) {
   }
 }
 
+// --------------------------------------------------
+// Public cleanup API
+// Works for both image buckets
+// --------------------------------------------------
+
+app.post("/api/cleanup-upload", async (req, res) => {
+  try {
+    if (!IMAGE_CLEANUP_SECRET) {
+      return res.status(503).json({
+        success: false,
+        message: "Image cleanup is not configured.",
+      });
+    }
+
+    const { tokens } = req.body || {};
+
+    if (
+      !Array.isArray(tokens) ||
+      tokens.length === 0 ||
+      tokens.length > 10 ||
+      !tokens.every(
+        (token) => typeof token === "string"
+      )
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Valid cleanup tokens are required.",
+      });
+    }
+
+    const verifiedTokens = tokens.map(
+      verifyCleanupToken
+    );
+
+    if (verifiedTokens.some((item) => !item)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid or expired cleanup token.",
+      });
+    }
+
+    // Group file paths by the bucket encoded in each signed token.
+    const pathsByBucket = new Map();
+
+    for (const item of verifiedTokens) {
+      if (!pathsByBucket.has(item.bucket)) {
+        pathsByBucket.set(item.bucket, new Set());
+      }
+
+      pathsByBucket.get(item.bucket).add(item.filePath);
+    }
+
+    for (const [bucket, pathSet] of pathsByBucket) {
+      const filePaths = [...pathSet];
+
+      if (filePaths.length === 0) {
+        continue;
+      }
+
+      const { error } = await supabase.storage
+        .from(bucket)
+        .remove(filePaths);
+
+      if (error) {
+        console.error(
+          `Cleanup failed for ${bucket}:`,
+          error
+        );
+
+        return res.status(500).json({
+          success: false,
+          message: "Failed to clean up uploaded images.",
+        });
+      }
+    }
+
+    return res.json({
+      success: true,
+      message: "Uploaded images cleaned up successfully.",
+    });
+  } catch (error) {
+    console.error("Public image cleanup error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Image cleanup failed.",
+    });
+  }
+});
+
+// --------------------------------------------------
+// Image proxy handler
+// --------------------------------------------------
+
 async function proxyImage(req, res, bucket, label) {
   try {
     const { url = "" } = req.query;
@@ -361,19 +807,110 @@ async function proxyImage(req, res, bucket, label) {
 }
 
 // --------------------------------------------------
-// Health Check
+// Receive one image
 // --------------------------------------------------
 
-app.get("/", (req, res) => {
-  res.json({
-    success: true,
-    message: "Japan Job System Backend is running.",
+function receiveSingleImage(req, res, next) {
+  upload.any()(req, res, (error) => {
+    if (error) {
+      return next(error);
+    }
+
+    if (req.files?.length > 1) {
+      return res.status(400).json({
+        success: false,
+        message: "Only one image is allowed per upload.",
+      });
+    }
+
+    req.file = req.files?.[0] || null;
+
+    return next();
   });
-});
+}
 
 // --------------------------------------------------
-// Attendance Student Registration
-// POST /api/attendance-student/register
+// Student image APIs
+// --------------------------------------------------
+
+app.post(
+  "/api/upload",
+  receiveSingleImage,
+  (req, res) =>
+    uploadImage(
+      req,
+      res,
+      "student-photos",
+      "Student"
+    )
+);
+
+app.post(
+  "/api/delete-images",
+  verifyFirebaseToken,
+  requireAdminOrTeacher,
+  (req, res) =>
+    deleteImages(
+      req,
+      res,
+      "student-photos",
+      "Student"
+    )
+);
+
+app.get(
+  "/api/student-photo",
+  (req, res) =>
+    proxyImage(
+      req,
+      res,
+      "student-photos",
+      "Student"
+    )
+);
+
+// --------------------------------------------------
+// Job student image APIs
+// --------------------------------------------------
+
+app.post(
+  "/api/job-student/upload",
+  receiveSingleImage,
+  (req, res) =>
+    uploadImage(
+      req,
+      res,
+      "job-student-photos",
+      "Job student"
+    )
+);
+
+app.post(
+  "/api/job-student/delete-images",
+  verifyFirebaseToken,
+  requireAdmin,
+  (req, res) =>
+    deleteImages(
+      req,
+      res,
+      "job-student-photos",
+      "Job student"
+    )
+);
+
+app.get(
+  "/api/job-student-photo",
+  (req, res) =>
+    proxyImage(
+      req,
+      res,
+      "job-student-photos",
+      "Job student"
+    )
+);
+
+// --------------------------------------------------
+// Attendance student registration API
 // --------------------------------------------------
 
 app.post(
@@ -412,94 +949,31 @@ app.post(
         });
       }
 
-      // Only accept explicitly permitted form fields.
-      // Never accept status or timestamps from the client.
+      const stringField = (value) =>
+        typeof value === "string" ? value.trim() : "";
+
       const applicationData = {
         id: studentId,
-        name: data.name.trim(),
-
-        furigana:
-          typeof data.furigana === "string"
-            ? data.furigana.trim()
-            : "",
-
-        nickname:
-          typeof data.nickname === "string"
-            ? data.nickname.trim()
-            : "",
-
-        profileImage:
-          typeof data.profileImage === "string"
-            ? data.profileImage
-            : "",
-
-        originalProfileImage:
-          typeof data.originalProfileImage === "string"
-            ? data.originalProfileImage
-            : "",
-
-        dateOfBirth:
-          typeof data.dateOfBirth === "string"
-            ? data.dateOfBirth
-            : "",
-
-        gender:
-          typeof data.gender === "string"
-            ? data.gender
-            : "",
-
-        nationality:
-          typeof data.nationality === "string"
-            ? data.nationality.trim()
-            : "",
-
-        phone:
-          typeof data.phone === "string"
-            ? data.phone.trim()
-            : "",
-
-        email:
-          typeof data.email === "string"
-            ? data.email.trim()
-            : "",
-
-        address:
-          typeof data.address === "string"
-            ? data.address.trim()
-            : "",
-
-        className: data.className.trim(),
-
-        jlptLevel:
-          typeof data.jlptLevel === "string"
-            ? data.jlptLevel
-            : "",
-
-        enrollmentDate:
-          typeof data.enrollmentDate === "string"
-            ? data.enrollmentDate
-            : "",
-
-        guardianName:
-          typeof data.guardianName === "string"
-            ? data.guardianName.trim()
-            : "",
-
-        guardianPhone:
-          typeof data.guardianPhone === "string"
-            ? data.guardianPhone.trim()
-            : "",
-
-        emergencyContact:
-          typeof data.emergencyContact === "string"
-            ? data.emergencyContact.trim()
-            : "",
-
-        notes:
-          typeof data.notes === "string"
-            ? data.notes.trim()
-            : "",
-
+        name: stringField(data.name),
+        furigana: stringField(data.furigana),
+        nickname: stringField(data.nickname),
+        profileImage: stringField(data.profileImage),
+        originalProfileImage: stringField(
+          data.originalProfileImage
+        ),
+        dateOfBirth: stringField(data.dateOfBirth),
+        gender: stringField(data.gender),
+        nationality: stringField(data.nationality),
+        phone: stringField(data.phone),
+        email: stringField(data.email),
+        address: stringField(data.address),
+        className: stringField(data.className),
+        jlptLevel: stringField(data.jlptLevel),
+        enrollmentDate: stringField(data.enrollmentDate),
+        guardianName: stringField(data.guardianName),
+        guardianPhone: stringField(data.guardianPhone),
+        emergencyContact: stringField(data.emergencyContact),
+        notes: stringField(data.notes),
         applicationStatus: "Pending",
         submittedAt: FieldValue.serverTimestamp(),
       };
@@ -516,47 +990,43 @@ app.post(
         randomUUID()
       );
 
-      await firestore.runTransaction(
-        async (transaction) => {
-          const registrySnapshot =
-            await transaction.get(registryRef);
+      await firestore.runTransaction(async (transaction) => {
+        const registrySnapshot = await transaction.get(
+          registryRef
+        );
 
-          if (registrySnapshot.exists) {
-            const error = new Error(
-              "This Student ID is already registered."
-            );
-            error.statusCode = 409;
-            throw error;
-          }
-
-          // Check applications created before the registry existed.
-          const existingQuery = applicationsRef
-            .where("id", "==", studentId)
-            .limit(1);
-
-          const existingSnapshot =
-            await transaction.get(existingQuery);
-
-          if (!existingSnapshot.empty) {
-            const error = new Error(
-              "This Student ID is already registered."
-            );
-            error.statusCode = 409;
-            throw error;
-          }
-
-          transaction.create(registryRef, {
-            id: studentId,
-            applicationId: applicationRef.id,
-            createdAt: FieldValue.serverTimestamp(),
-          });
-
-          transaction.create(
-            applicationRef,
-            applicationData
+        if (registrySnapshot.exists) {
+          const error = new Error(
+            "This Student ID is already registered."
           );
+          error.statusCode = 409;
+          throw error;
         }
-      );
+
+        const existingQuery = applicationsRef
+          .where("id", "==", studentId)
+          .limit(1);
+
+        const existingSnapshot = await transaction.get(
+          existingQuery
+        );
+
+        if (!existingSnapshot.empty) {
+          const error = new Error(
+            "This Student ID is already registered."
+          );
+          error.statusCode = 409;
+          throw error;
+        }
+
+        transaction.create(registryRef, {
+          id: studentId,
+          applicationId: applicationRef.id,
+          createdAt: FieldValue.serverTimestamp(),
+        });
+
+        transaction.create(applicationRef, applicationData);
+      });
 
       console.log("Registration submitted:", studentId);
 
@@ -584,68 +1054,7 @@ app.post(
 );
 
 // --------------------------------------------------
-// Attendance Student Image APIs
-// --------------------------------------------------
-
-app.post(
-  "/api/upload",
-  upload.single("image"),
-  (req, res) =>
-    uploadImage(req, res, "student-photos", "Student")
-);
-
-app.post(
-  "/api/delete-images",
-  (req, res) =>
-    deleteImages(req, res, "student-photos", "Student")
-);
-
-app.get(
-  "/api/student-photo",
-  (req, res) =>
-    proxyImage(req, res, "student-photos", "Student")
-);
-
-// --------------------------------------------------
-// Job Student Image APIs
-// --------------------------------------------------
-
-app.post(
-  "/api/job-student/upload",
-  upload.single("image"),
-  (req, res) =>
-    uploadImage(
-      req,
-      res,
-      "job-student-photos",
-      "Job Student"
-    )
-);
-
-app.post(
-  "/api/job-student/delete-images",
-  (req, res) =>
-    deleteImages(
-      req,
-      res,
-      "job-student-photos",
-      "Job Student"
-    )
-);
-
-app.get(
-  "/api/job-student-photo",
-  (req, res) =>
-    proxyImage(
-      req,
-      res,
-      "job-student-photos",
-      "Job Student"
-    )
-);
-
-// --------------------------------------------------
-// Upload / JSON Error Handler
+// Error Handler
 // --------------------------------------------------
 
 app.use((error, req, res, next) => {
@@ -684,7 +1093,5 @@ app.use((error, req, res, next) => {
 // --------------------------------------------------
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(
-    `Backend server running on port ${PORT}`
-  );
+  console.log(`Backend server running on port ${PORT}`);
 });
