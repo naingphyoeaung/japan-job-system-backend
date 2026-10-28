@@ -161,6 +161,8 @@ app.use(express.json({ limit: "20mb" }));
 // --------------------------------------------------
 
 async function verifyFirebaseToken(req, res, next) {
+ const authorization = req.headers.authorization || "";
+
   try {
     if (!firebaseAdminReady || getApps().length === 0) {
       return res.status(503).json({
@@ -169,7 +171,6 @@ async function verifyFirebaseToken(req, res, next) {
       });
     }
 
-    const authorization = req.headers.authorization || "";
     const match = authorization.match(/^Bearer (.+)$/i);
 
     if (!match) {
