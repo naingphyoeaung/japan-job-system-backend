@@ -187,10 +187,13 @@ async function verifyFirebaseToken(req, res, next) {
 
     return next();
   } catch (error) {
-    console.error(
-      "Authentication failed:",
-      error.code || error.name
-    );
+   console.error("Authentication failed:", {
+  code: error.code,
+  name: error.name,
+  message: error.message,
+  tokenType: typeof match?.[1],
+  tokenParts: match?.[1]?.split(".").length,
+});
 
     return res.status(401).json({
       success: false,
