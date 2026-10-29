@@ -11,7 +11,7 @@ import {
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { createClient } from "@supabase/supabase-js";
-
+import { google } from "googleapis";
 import {
   initializeApp,
   cert,
@@ -1053,6 +1053,153 @@ app.post(
       return res.status(500).json({
         success: false,
         message: "Unable to submit registration.",
+      });
+    }
+  }
+);
+// =====================================================
+// ATTENDANCE ANALYTICS — ADMIN / TEACHER ONLY
+// =====================================================
+
+const ANALYTICS_SPREADSHEET_ID =
+  "1apOx658D0-fIiQ0ttlRtQq9fGp2elNiN8KsY0A0Yeb4";
+
+const ANALYTICS_SHEETS = [
+  "Summary_Aung_Phyo_Khant1",
+  "Summary_Aung_Phyo_Khant2",
+  "Summary_Sis Too1",
+  "Summary_Sis Too2",
+  "Summary_Han",
+];
+
+function isHolidayRed(color) {
+  if (!color) return false;
+
+  const red = color.red ?? 0;
+  const green = color.green ?? 0;
+  const blue = color.blue ?? 0;
+
+  return red > 0.8 && green < 0.4 && blue < 0.4;
+}
+
+async function getAnalyticsSheetsClient() {
+  const { GoogleAuth } = google.auth;
+  const fs = await import("node:fs/promises");
+  const path = await import("node:path");
+
+  const localKeyPath = path.join(
+    process.env.USERPROFILE || "",
+    "Downloads",
+    "japan-job-system-6bf5b944098e.json"
+  );
+
+  let auth;
+
+  try {
+    await fs.access(localKeyPath);
+
+    auth = new GoogleAuth({
+      keyFile: localKeyPath,
+      scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
+    });
+  } catch {
+    const projectId = process.env.FIREBASE_PROJECT_ID;
+    const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+    const privateKey = process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n");
+
+    if (!projectId || !clientEmail || !privateKey) {
+      throw new Error("Google Sheets service-account credentials are missing.");
+    }
+
+    auth = new GoogleAuth({
+      credentials: {
+        project_id: projectId,
+        client_email: clientEmail,
+        private_key: privateKey,
+      },
+      scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
+    });
+  }
+
+  return google.sheets({
+    version: "v4",
+    auth,
+  });
+}
+
+app.get(
+  "/api/attendance-analytics",
+  verifyFirebaseToken,
+  requireAdminOrTeacher,
+  async (req, res) => {
+    try {
+      const sheetsApi = await getAnalyticsSheetsClient();
+
+      const result = await sheetsApi.spreadsheets.get({
+        spreadsheetId: ANALYTICS_SPREADSHEET_ID,
+        includeGridData: true,
+        ranges: ANALYTICS_SHEETS.map((name) => `'${name}'!A:ZZ`),
+        fields:
+          "sheets(properties(title),data(rowData(values(formattedValue,effectiveValue,effectiveFormat(backgroundColor)))))",
+      });
+
+      const sheets = (result.data.sheets || []).map((sheet) => {
+        const rows = sheet.data?.[0]?.rowData || [];
+        const values = rows.map((row) =>
+          (row.values || []).map((cell) => {
+            if (cell.formattedValue !== undefined) {
+              return cell.formattedValue;
+            }
+
+            const value = cell.effectiveValue;
+
+            if (!value) return "";
+
+            if (value.stringValue !== undefined) return value.stringValue;
+            if (value.numberValue !== undefined) return value.numberValue;
+            if (value.boolValue !== undefined) return value.boolValue;
+
+            return "";
+          })
+        );
+
+        const header = rows[0]?.values || [];
+        const holidayDates = new Set();
+
+        header.forEach((cell, columnIndex) => {
+          const date = values[0]?.[columnIndex];
+
+          if (!date) return;
+
+          const columnIsRed = rows.some((row) => {
+            const color =
+              row.values?.[columnIndex]?.effectiveFormat?.backgroundColor;
+
+            return isHolidayRed(color);
+          });
+
+          if (columnIsRed) {
+            holidayDates.add(String(date).trim());  
+          }
+        });
+
+        return {
+          name: sheet.properties?.title || "",
+          rows: values,
+          holidayDates: [...holidayDates],
+        };
+      });
+
+      res.json({
+        success: true,
+        sheets,
+      });
+    } catch (error) {
+      console.error("Attendance analytics error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Unable to load attendance analytics.",
       });
     }
   }
