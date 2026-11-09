@@ -7,6 +7,7 @@ import {
   randomUUID,
   createHmac,
   timingSafeEqual,
+  createHash,
 } from "node:crypto";
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -913,6 +914,145 @@ app.get(
       "Job student"
     )
 );
+// --------------------------------------------------
+// Dormitory registration API
+// --------------------------------------------------
+
+app.post("/api/dormitory/register", async (req, res) => {
+  try {
+    if (!firestore) {
+      return res.status(503).json({
+        success: false,
+        message: "Registration service is not configured.",
+      });
+    }
+
+    const data = req.body || {};
+
+    const stringField = (value) =>
+      typeof value === "string" ? value.trim() : "";
+
+    const name = stringField(data.name);
+    const dateOfBirth = stringField(data.dateOfBirth);
+    const fatherName = stringField(data.fatherName);
+    const motherName = stringField(data.motherName);
+    const nrcNumber = stringField(data.nrcNumber);
+    const ethnicity = stringField(data.ethnicity);
+    const religion = stringField(data.religion);
+    const occupation = stringField(data.occupation);
+    const originRegion = stringField(data.originRegion);
+    const dormitoryNumber = stringField(data.dormitoryNumber);
+    const age = Number(data.age);
+
+    if (
+      !name ||
+      !dateOfBirth ||
+      !fatherName ||
+      !motherName ||
+      !nrcNumber ||
+      !ethnicity ||
+      !religion ||
+      !occupation ||
+      !originRegion ||
+      !Number.isInteger(age) ||
+      age < 0 ||
+      !["41", "47", "51", "53", "92", "85"].includes(
+        dormitoryNumber
+      )
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Please complete all required information.",
+      });
+    }
+
+    const normalizedNrc = nrcNumber
+      .normalize("NFC")
+      .replace(/\s+/g, "")
+      .toUpperCase();
+
+    const nrcHash = createHash("sha256")
+      .update(normalizedNrc)
+      .digest("hex");
+
+    const registryRef = firestore
+      .collection("dormitoryNrcRegistry")
+      .doc(nrcHash);
+
+    const applicationsRef = firestore.collection(
+      "dormitoryApplications"
+    );
+
+    const applicationRef = applicationsRef.doc(randomUUID());
+
+    const applicationData = {
+      id: applicationRef.id,
+      name,
+      age,
+      dateOfBirth,
+      fatherName,
+      motherName,
+      nrcNumber,
+      ethnicity,
+      religion,
+      occupation,
+      originRegion,
+      dormitoryNumber,
+      applicationStatus: "Pending",
+      submittedAt: FieldValue.serverTimestamp(),
+    };
+
+    await firestore.runTransaction(async (transaction) => {
+      const registrySnapshot = await transaction.get(registryRef);
+
+      if (registrySnapshot.exists) {
+        const error = new Error("Duplicate NRC number.");
+        error.statusCode = 409;
+        throw error;
+      }
+
+      // Check applications submitted before this registry existed.
+      const existingQuery = applicationsRef
+        .where("nrcNumber", "==", nrcNumber)
+        .limit(1);
+
+      const existingSnapshot = await transaction.get(existingQuery);
+
+      if (!existingSnapshot.empty) {
+        const error = new Error("Duplicate NRC number.");
+        error.statusCode = 409;
+        throw error;
+      }
+
+      transaction.create(registryRef, {
+        applicationId: applicationRef.id,
+        createdAt: FieldValue.serverTimestamp(),
+      });
+
+      transaction.create(applicationRef, applicationData);
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: "Registration submitted successfully.",
+    });
+  } catch (err) {
+    if (err.statusCode === 409) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "ဤ NRC နံပါတ်ဖြင့် မှတ်ပုံတင်ထားပြီးဖြစ်ပါသည်။ ထပ်မံလျှောက်ထား၍ မရပါ။",
+      });
+    }
+
+    console.error("Dormitory registration error:", err);
+
+    return res.status(500).json({
+      success: false,
+      message: "Registration failed. Please try again.",
+    });
+  }
+});
 
 // --------------------------------------------------
 // Attendance student registration API
