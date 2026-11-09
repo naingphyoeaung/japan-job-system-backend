@@ -917,7 +917,7 @@ app.get(
 // --------------------------------------------------
 // Dormitory registration API
 // --------------------------------------------------
-
+console.log("DORMITORY REGISTRATION ROUTE LOADED");
 app.post("/api/dormitory/register", async (req, res) => {
   try {
     if (!firestore) {
