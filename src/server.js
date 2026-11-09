@@ -917,6 +917,15 @@ app.get(
 // --------------------------------------------------
 // Dormitory registration API
 // --------------------------------------------------
+const normalizeNrc = (value) =>
+  String(value || "")
+    .normalize("NFC")
+    .replace(/[၀-၉]/g, (digit) =>
+      String("၀၁၂၃၄၅၆၇၈၉".indexOf(digit))
+    )
+    .replace(/\s+/g, "")
+    .toUpperCase();
+    
 console.log("DORMITORY REGISTRATION ROUTE LOADED");
 app.post("/api/dormitory/register", async (req, res) => {
   try {
@@ -966,14 +975,12 @@ app.post("/api/dormitory/register", async (req, res) => {
       });
     }
 
-    const normalizedNrc = nrcNumber
-      .normalize("NFC")
-      .replace(/\s+/g, "")
-      .toUpperCase();
+    const normalizedNrc = normalizeNrc(nrcNumber);
 
-    const nrcHash = createHash("sha256")
-      .update(normalizedNrc)
-      .digest("hex");
+const nrcHash = createHash("sha256")
+  .update(normalizedNrc)
+  .digest("hex");
+
 
     const registryRef = firestore
       .collection("dormitoryNrcRegistry")
@@ -1011,18 +1018,19 @@ app.post("/api/dormitory/register", async (req, res) => {
         throw error;
       }
 
-      // Check applications submitted before this registry existed.
-      const existingQuery = applicationsRef
-        .where("nrcNumber", "==", nrcNumber)
-        .limit(1);
+    // Check all existing applications using normalized NRC.
+const existingSnapshot = await transaction.get(applicationsRef);
 
-      const existingSnapshot = await transaction.get(existingQuery);
+const duplicateExists = existingSnapshot.docs.some((doc) => {
+  const existingNrc = normalizeNrc(doc.data().nrcNumber);
+  return existingNrc === normalizedNrc;
+});
 
-      if (!existingSnapshot.empty) {
-        const error = new Error("Duplicate NRC number.");
-        error.statusCode = 409;
-        throw error;
-      }
+if (duplicateExists) {
+  const error = new Error("Duplicate NRC number.");
+  error.statusCode = 409;
+  throw error;
+}
 
       transaction.create(registryRef, {
         applicationId: applicationRef.id,
