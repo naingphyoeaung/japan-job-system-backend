@@ -1011,7 +1011,10 @@ const nrcHash = createHash("sha256")
 
     await firestore.runTransaction(async (transaction) => {
       const registrySnapshot = await transaction.get(registryRef);
-
+      console.log("DORMITORY NRC CHECK:", {
+  hash: nrcHash.slice(0, 12),
+  registryExists: registrySnapshot.exists,
+});
       if (registrySnapshot.exists) {
         const error = new Error("Duplicate NRC number.");
         error.statusCode = 409;
