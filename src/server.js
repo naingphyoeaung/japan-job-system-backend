@@ -1066,6 +1066,222 @@ if (duplicateExists) {
 });
 
 // --------------------------------------------------
+// Dormitory Monthly Confirmation API
+// --------------------------------------------------
+
+const getMyanmarMonth = () => {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Yangon",
+    year: "numeric",
+    month: "2-digit",
+  }).formatToParts(new Date());
+
+  const year = parts.find((p) => p.type === "year").value;
+  const month = parts.find((p) => p.type === "month").value;
+
+  return `${year}-${month}`;
+};
+
+// Find approved dormitory resident by NRC
+app.post("/api/dormitory/monthly-lookup", async (req, res) => {
+  try {
+    if (!firestore) {
+      return res.status(503).json({
+        success: false,
+        message: "Service is not configured.",
+      });
+    }
+
+    const nrcNumber = String(req.body?.nrcNumber || "").trim();
+
+    if (!nrcNumber) {
+      return res.status(400).json({
+        success: false,
+        message: "NRC နံပါတ် ဖြည့်ပါ။",
+      });
+    }
+
+    const normalizedNrc = normalizeNrc(nrcNumber);
+
+    const nrcHash = createHash("sha256")
+      .update(normalizedNrc)
+      .digest("hex");
+
+    const registrySnapshot = await firestore
+      .collection("dormitoryNrcRegistry")
+      .doc(nrcHash)
+      .get();
+
+    if (!registrySnapshot.exists) {
+      return res.status(404).json({
+        success: false,
+        message: "မှတ်ပုံတင်ထားသော အချက်အလက် မတွေ့ပါ။",
+      });
+    }
+
+    const applicationId = registrySnapshot.data().applicationId;
+
+    const applicationSnapshot = await firestore
+      .collection("dormitoryApplications")
+      .doc(applicationId)
+      .get();
+
+    if (
+      !applicationSnapshot.exists ||
+      applicationSnapshot.data().applicationStatus !== "Approved"
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: "အဆောင်ဝင်ခွင့် အတည်ပြုထားခြင်း မရှိသေးပါ။",
+      });
+    }
+
+    const resident = applicationSnapshot.data();
+    const month = getMyanmarMonth();
+
+    const confirmationId = `${applicationId}_${month}`;
+
+    const confirmationSnapshot = await firestore
+      .collection("dormitoryMonthlyConfirmations")
+      .doc(confirmationId)
+      .get();
+
+    return res.json({
+      success: true,
+      resident: {
+        id: applicationId,
+        name: resident.name,
+        dormitoryNumber: resident.dormitoryNumber,
+      },
+      month,
+      alreadyConfirmed: confirmationSnapshot.exists,
+    });
+  } catch (err) {
+    console.error("Dormitory monthly lookup error:", err);
+
+    return res.status(500).json({
+      success: false,
+      message: "အချက်အလက် ရှာဖွေရာတွင် အမှားဖြစ်နေပါသည်။",
+    });
+  }
+});
+
+
+// Confirm monthly dormitory residence
+app.post("/api/dormitory/monthly-confirm", async (req, res) => {
+  try {
+    if (!firestore) {
+      return res.status(503).json({
+        success: false,
+        message: "Service is not configured.",
+      });
+    }
+
+    const nrcNumber = String(req.body?.nrcNumber || "").trim();
+
+    if (!nrcNumber) {
+      return res.status(400).json({
+        success: false,
+        message: "NRC နံပါတ် ဖြည့်ပါ။",
+      });
+    }
+
+    const normalizedNrc = normalizeNrc(nrcNumber);
+
+    const nrcHash = createHash("sha256")
+      .update(normalizedNrc)
+      .digest("hex");
+
+    const registryRef = firestore
+      .collection("dormitoryNrcRegistry")
+      .doc(nrcHash);
+
+    const confirmationsRef = firestore.collection(
+      "dormitoryMonthlyConfirmations"
+    );
+
+    const month = getMyanmarMonth();
+
+    await firestore.runTransaction(async (transaction) => {
+      const registrySnapshot = await transaction.get(registryRef);
+
+      if (!registrySnapshot.exists) {
+        const error = new Error("Resident not found.");
+        error.statusCode = 404;
+        throw error;
+      }
+
+      const applicationId = registrySnapshot.data().applicationId;
+
+      const applicationRef = firestore
+        .collection("dormitoryApplications")
+        .doc(applicationId);
+
+      const applicationSnapshot = await transaction.get(applicationRef);
+
+      if (
+        !applicationSnapshot.exists ||
+        applicationSnapshot.data().applicationStatus !== "Approved"
+      ) {
+        const error = new Error("Resident is not approved.");
+        error.statusCode = 403;
+        throw error;
+      }
+
+      const resident = applicationSnapshot.data();
+
+      const confirmationRef = confirmationsRef.doc(
+        `${applicationId}_${month}`
+      );
+
+      const confirmationSnapshot = await transaction.get(
+        confirmationRef
+      );
+
+      if (confirmationSnapshot.exists) {
+        const error = new Error("Already confirmed.");
+        error.statusCode = 409;
+        throw error;
+      }
+
+      transaction.create(confirmationRef, {
+        studentId: applicationId,
+        month,
+        name: resident.name,
+        dormitoryNumber: resident.dormitoryNumber,
+        confirmedAt: FieldValue.serverTimestamp(),
+      });
+    });
+
+    return res.json({
+      success: true,
+      message: "ယခုလအတွက် အဆောင်နေထိုင်မှု အတည်ပြုပြီးပါပြီ။",
+      month,
+    });
+  } catch (err) {
+    if (err.statusCode) {
+      return res.status(err.statusCode).json({
+        success: false,
+        message:
+          err.statusCode === 409
+            ? "ယခုလအတွက် Confirm လုပ်ပြီးဖြစ်ပါသည်။"
+            : err.statusCode === 403
+              ? "အဆောင်ဝင်ခွင့် အတည်ပြုထားခြင်း မရှိသေးပါ။"
+              : "မှတ်ပုံတင်ထားသော အချက်အလက် မတွေ့ပါ။",
+      });
+    }
+
+    console.error("Dormitory monthly confirmation error:", err);
+
+    return res.status(500).json({
+      success: false,
+      message: "Confirmation failed. Please try again.",
+    });
+  }
+});
+
+
+// --------------------------------------------------
 // Attendance student registration API
 // --------------------------------------------------
 
