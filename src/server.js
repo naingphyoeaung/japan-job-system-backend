@@ -25,6 +25,7 @@ import {
 } from "firebase-admin/firestore";
 
 import { getAuth } from "firebase-admin/auth";
+import { getAppCheck } from "firebase-admin/app-check";
 
 dotenv.config();
 
@@ -205,6 +206,39 @@ async function verifyFirebaseToken(req, res, next) {
   }
 }
 
+
+async function verifyAppCheckToken(req, res, next) {
+  const appCheckToken = req.headers["x-firebase-appcheck"];
+
+  if (!firebaseAdminReady || getApps().length === 0) {
+    return res.status(503).json({
+      success: false,
+      message: "App Check service is unavailable.",
+    });
+  }
+
+  if (!appCheckToken) {
+    return res.status(401).json({
+      success: false,
+      message: "App Check token is required.",
+    });
+  }
+
+  try {
+    await getAppCheck().verifyToken(appCheckToken);
+
+    return next();
+  } catch (error) {
+    console.error("App Check verification failed:", error.message);
+
+    return res.status(401).json({
+      success: false,
+      message: "Invalid App Check token.",
+    });
+  }
+}
+
+
 function requireAdmin(req, res, next) {
   if (req.authUser?.role !== "admin") {
     return res.status(403).json({
@@ -228,6 +262,267 @@ function requireAdminOrTeacher(req, res, next) {
 
   return next();
 }
+
+// ==========================================
+// GET USERS BY FIREBASE CUSTOM CLAIMS ROLE
+// ==========================================
+
+async function getUsersByRoles(targetRoles) {
+  const matchedUsers = [];
+  let pageToken;
+
+  do {
+    const result = await getAuth().listUsers(
+      1000,
+      pageToken
+    );
+
+    for (const user of result.users) {
+      const role = user.customClaims?.role;
+
+      if (targetRoles.includes(role)) {
+        matchedUsers.push({
+          uid: user.uid,
+          role,
+        });
+      }
+    }
+
+    pageToken = result.pageToken;
+  } while (pageToken);
+
+  return matchedUsers;
+}
+
+// ==========================================
+// PUBLIC JOB STUDENT REGISTRATION NOTIFICATION
+// App Check protected
+// ==========================================
+
+app.post(
+  "/api/public/job-student-registration-notification",
+  verifyAppCheckToken,
+  async (req, res) => {
+    try {
+      if (!firebaseAdminReady || !firestore) {
+        return res.status(503).json({
+          success: false,
+          message: "Notification service is unavailable.",
+        });
+      }
+
+      const { applicationId } = req.body;
+
+      if (
+        typeof applicationId !== "string" ||
+        !applicationId.trim() ||
+        applicationId.length > 150
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid application ID.",
+        });
+      }
+
+      const applicationRef = firestore
+        .collection("jobStudentApplications")
+        .doc(applicationId);
+
+      const applicationSnapshot = await applicationRef.get();
+
+      if (!applicationSnapshot.exists) {
+        return res.status(404).json({
+          success: false,
+          message: "Application not found.",
+        });
+      }
+
+      const application = applicationSnapshot.data();
+
+      if (application.applicationStatus !== "Pending") {
+        return res.status(400).json({
+          success: false,
+          message: "Application is not pending.",
+        });
+      }
+
+      const users = await getUsersByRoles([
+        "admin",
+        "teacher",
+      ]);
+
+      if (users.length > 450) {
+        return res.status(503).json({
+          success: false,
+          message: "Too many notification recipients.",
+        });
+      }
+
+      const result = await firestore.runTransaction(
+        async (transaction) => {
+          const freshApplication =
+            await transaction.get(applicationRef);
+
+          if (!freshApplication.exists) {
+            throw new Error("APPLICATION_NOT_FOUND");
+          }
+
+          const freshData = freshApplication.data();
+
+          if (freshData.notificationSentAt) {
+            return false;
+          }
+
+          if (freshData.applicationStatus !== "Pending") {
+            throw new Error("APPLICATION_NOT_PENDING");
+          }
+
+          const notificationRefs = users.map((user) =>
+            firestore
+              .collection("users")
+              .doc(user.uid)
+              .collection("notifications")
+              .doc(applicationId)
+          );
+
+          for (let i = 0; i < users.length; i++) {
+            transaction.set(notificationRefs[i], {
+              title: "New Student Registration",
+              message: `${freshData.name || "A student"} has submitted a new registration.`,
+              type: "newStudent",
+              isRead: false,
+              createdAt: FieldValue.serverTimestamp(),
+              createdBy: "system",
+              applicationId,
+            });
+          }
+
+          transaction.update(applicationRef, {
+            notificationSentAt: FieldValue.serverTimestamp(),
+          });
+
+          return true;
+        }
+      );
+
+      return res.status(200).json({
+        success: true,
+        alreadySent: !result,
+        sentCount: result ? users.length : 0,
+      });
+
+    } catch (error) {
+      if (error.message === "APPLICATION_NOT_FOUND") {
+        return res.status(404).json({
+          success: false,
+          message: "Application not found.",
+        });
+      }
+
+      if (error.message === "APPLICATION_NOT_PENDING") {
+        return res.status(400).json({
+          success: false,
+          message: "Application is not pending.",
+        });
+      }
+
+      console.error(
+        "Public registration notification error:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        message: "Unable to send registration notification.",
+      });
+    }
+  }
+);
+
+// ==========================================
+// CREATE NOTIFICATION
+// Admin only
+// ==========================================
+
+app.post(
+  "/api/notifications",
+  verifyFirebaseToken,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      if (!firebaseAdminReady || !firestore) {
+        return res.status(503).json({
+          success: false,
+          message: "Notification service is unavailable.",
+        });
+      }
+
+      const {
+        title,
+        message,
+        type,
+      } = req.body;
+
+      const notificationRoles = {
+        newStudent: ["admin", "teacher"],
+        newApplication: ["admin", "teacher"],
+        attendance: ["admin", "teacher"],
+        systemUpdates: ["admin"],
+        userManagement: ["admin"],
+      };
+
+      const targetRoles = notificationRoles[type];
+
+      if (
+        typeof title !== "string" ||
+        !title.trim() ||
+        typeof message !== "string" ||
+        !message.trim() ||
+        !targetRoles
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid notification data.",
+        });
+      }
+
+      const users = await getUsersByRoles(targetRoles);
+
+      const batch = firestore.batch();
+
+      for (const user of users) {
+        const notificationRef = firestore
+          .collection("users")
+          .doc(user.uid)
+          .collection("notifications")
+          .doc();
+
+        batch.set(notificationRef, {
+          title: title.trim(),
+          message: message.trim(),
+          type,
+          isRead: false,
+          createdAt: FieldValue.serverTimestamp(),
+          createdBy: req.authUser.uid,
+        });
+      }
+
+      await batch.commit();
+
+      return res.status(201).json({
+        success: true,
+        sentCount: users.length,
+      });
+    } catch (error) {
+      console.error("Create notification error:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Unable to create notification.",
+      });
+    }
+  }
+);
 
 // --------------------------------------------------
 // Multer image upload configuration
@@ -1609,6 +1904,146 @@ app.use((error, req, res, next) => {
     message: "Internal server error.",
   });
 });
+
+
+/* ==========================================
+   NOTIFICATION APIs
+========================================== */
+
+// Get current user's notifications
+app.get(
+  "/api/notifications",
+  verifyFirebaseToken,
+  requireAdminOrTeacher,
+  async (req, res) => {
+    try {
+      const userId = req.authUser.uid;
+
+      const snapshot = await firestore
+        .collection("users")
+        .doc(userId)
+        .collection("notifications")
+        .orderBy("createdAt", "desc")
+        .limit(50)
+        .get();
+
+      const notifications = snapshot.docs.map((doc) => ({
+        id: doc.id,
+        ...doc.data(),
+      }));
+
+      res.json({
+        success: true,
+        notifications,
+      });
+    } catch (error) {
+      console.error("Get notifications error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Unable to load notifications.",
+      });
+    }
+  }
+);
+
+
+// Mark one notification as read
+app.patch(
+  "/api/notifications/:id/read",
+  verifyFirebaseToken,
+  requireAdminOrTeacher,
+  async (req, res) => {
+    try {
+      const userId = req.authUser.uid;
+      const notificationId = req.params.id;
+
+      const notificationRef = firestore
+        .collection("users")
+        .doc(userId)
+        .collection("notifications")
+        .doc(notificationId);
+
+      await firestore.runTransaction(async (transaction) => {
+        const doc = await transaction.get(notificationRef);
+
+        if (!doc.exists) {
+          throw new Error("NOTIFICATION_NOT_FOUND");
+        }
+
+        transaction.update(notificationRef, {
+          isRead: true,
+          readAt: FieldValue.serverTimestamp(),
+        });
+      });
+
+      res.json({
+        success: true,
+        message: "Notification marked as read.",
+      });
+    } catch (error) {
+      if (error.message === "NOTIFICATION_NOT_FOUND") {
+        return res.status(404).json({
+          success: false,
+          message: "Notification not found.",
+        });
+      }
+
+      console.error("Mark notification read error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Unable to update notification.",
+      });
+    }
+  }
+);
+
+
+// Mark all notifications as read
+app.patch(
+  "/api/notifications/read-all",
+  verifyFirebaseToken,
+  requireAdminOrTeacher,
+  async (req, res) => {
+    try {
+      const userId = req.authUser.uid;
+
+      const snapshot = await firestore
+        .collection("users")
+        .doc(userId)
+        .collection("notifications")
+        .where("isRead", "==", false)
+        .limit(450)
+        .get();
+
+      if (!snapshot.empty) {
+        const batch = firestore.batch();
+
+        snapshot.docs.forEach((doc) => {
+          batch.update(doc.ref, {
+            isRead: true,
+            readAt: FieldValue.serverTimestamp(),
+          });
+        });
+
+        await batch.commit();
+      }
+
+      res.json({
+        success: true,
+        updatedCount: snapshot.size,
+      });
+    } catch (error) {
+      console.error("Mark all notifications read error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Unable to update notifications.",
+      });
+    }
+  }
+);
 
 // --------------------------------------------------
 // Start Server
