@@ -172,8 +172,8 @@ async function generateMonthlyBilling() {
     }
   }
 
-  await Promise.all(writeTasks);
   await bulkWriter.close();
+  await Promise.all(writeTasks);
 
   console.log("Monthly billing completed.");
   console.log({
