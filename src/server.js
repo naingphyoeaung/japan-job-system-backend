@@ -1491,6 +1491,168 @@ app.patch(
 
 
 // --------------------------------------------------
+// Payment Management - Student List API
+// --------------------------------------------------
+
+app.get(
+  "/api/payments/students",
+  verifyFirebaseToken,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      if (!firestore) {
+        return res.status(503).json({
+          success: false,
+          message: "Payment service is unavailable.",
+        });
+      }
+
+      const snapshot = await firestore
+        .collection("paymentProfiles")
+        .get();
+
+      const students = snapshot.docs.map((doc) => {
+        const data = doc.data();
+
+        return {
+          studentId: doc.id,
+          studentName: data.studentName || "",
+          dormitoryNumber: data.dormitoryNumber || "",
+          paymentCategory: data.paymentCategory || null,
+          monthlyFee: data.monthlyFee ?? null,
+          billingStartMonth: data.billingStartMonth || "",
+          lastChargeMonth: data.lastChargeMonth || null,
+          checkOutDate: data.checkOutDate || null,
+          status: data.status || "Active",
+        };
+      });
+
+      students.sort((a, b) =>
+        a.studentName.localeCompare(b.studentName)
+      );
+
+      return res.status(200).json({
+        success: true,
+        data: students,
+      });
+    } catch (error) {
+      console.error("Payment student list error:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Unable to load payment students.",
+      });
+    }
+  }
+);
+
+
+// --------------------------------------------------
+// Payment Management - Assign Student Category API
+// --------------------------------------------------
+
+app.patch(
+  "/api/payments/students/:studentId/category",
+  verifyFirebaseToken,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      if (!firestore) {
+        return res.status(503).json({
+          success: false,
+          message: "Payment service is unavailable.",
+        });
+      }
+
+      const { studentId } = req.params;
+      const { paymentCategory } = req.body || {};
+
+      if (!studentId || studentId.includes("/")) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid student ID.",
+        });
+      }
+
+      const categoryFees = {
+        school: 300000,
+        "non-school": 200000,
+      };
+
+      if (!Object.prototype.hasOwnProperty.call(
+        categoryFees,
+        paymentCategory
+      )) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid payment category.",
+        });
+      }
+
+      const profileRef = firestore
+        .collection("paymentProfiles")
+        .doc(studentId);
+
+      const result = await firestore.runTransaction(
+        async (transaction) => {
+          const profileSnapshot =
+            await transaction.get(profileRef);
+
+          if (!profileSnapshot.exists) {
+            const error = new Error(
+              "Payment profile not found."
+            );
+            error.statusCode = 404;
+            throw error;
+          }
+
+          const profileData = profileSnapshot.data();
+
+          if (profileData.status !== "Active") {
+            const error = new Error(
+              "Only active students can be assigned a category."
+            );
+            error.statusCode = 400;
+            throw error;
+          }
+
+          transaction.update(profileRef, {
+            paymentCategory,
+            monthlyFee: categoryFees[paymentCategory],
+            updatedAt: FieldValue.serverTimestamp(),
+          });
+
+          return {
+            studentId,
+            paymentCategory,
+            monthlyFee: categoryFees[paymentCategory],
+          };
+        }
+      );
+
+      return res.status(200).json({
+        success: true,
+        message: "Payment category updated successfully.",
+        data: result,
+      });
+    } catch (error) {
+      console.error("Payment category update error:", error);
+
+      return res.status(error.statusCode || 500).json({
+        success: false,
+        message:
+          error.statusCode === 404
+            ? error.message
+            : error.statusCode === 400
+              ? error.message
+              : "Unable to update payment category.",
+      });
+    }
+  }
+);
+
+
+// --------------------------------------------------
 // Dormitory Monthly Confirmation API
 // --------------------------------------------------
 
