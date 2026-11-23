@@ -1360,6 +1360,136 @@ if (duplicateExists) {
   }
 });
 
+
+// --------------------------------------------------
+// Dormitory Approval + Payment Profile API
+// --------------------------------------------------
+
+app.patch(
+  "/api/dormitory/:applicationId/status",
+  verifyFirebaseToken,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      if (!firestore) {
+        return res.status(503).json({
+          success: false,
+          message: "Payment service is unavailable.",
+        });
+      }
+
+      const { applicationId } = req.params;
+      const newStatus = req.body?.applicationStatus;
+
+      if (!applicationId || applicationId.includes("/")) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid application ID.",
+        });
+      }
+
+      if (!["Approved", "Rejected"].includes(newStatus)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid application status.",
+        });
+      }
+
+      const applicationRef = firestore
+        .collection("dormitoryApplications")
+        .doc(applicationId);
+
+      const paymentProfileRef = firestore
+        .collection("paymentProfiles")
+        .doc(applicationId);
+
+      const result = await firestore.runTransaction(
+        async (transaction) => {
+          const applicationSnapshot =
+            await transaction.get(applicationRef);
+
+          if (!applicationSnapshot.exists) {
+            const error = new Error(
+              "Dormitory application not found."
+            );
+            error.statusCode = 404;
+            throw error;
+          }
+
+          const applicationData = applicationSnapshot.data();
+
+          if (newStatus === "Approved") {
+            const profileSnapshot =
+              await transaction.get(paymentProfileRef);
+
+            if (!profileSnapshot.exists) {
+              const parts = new Intl.DateTimeFormat("en-CA", {
+                timeZone: "Asia/Yangon",
+                year: "numeric",
+                month: "2-digit",
+              }).formatToParts(new Date());
+
+              const year = parts.find(
+                (part) => part.type === "year"
+              ).value;
+
+              const month = parts.find(
+                (part) => part.type === "month"
+              ).value;
+
+              transaction.create(paymentProfileRef, {
+                studentId: applicationId,
+                studentName: applicationData.name || "",
+                dormitoryNumber:
+                  applicationData.dormitoryNumber || "",
+                paymentCategory: null,
+                monthlyFee: null,
+                billingStartMonth: `${year}-${month}`,
+                lastChargeMonth: null,
+                checkOutDate: null,
+                status: "Active",
+                createdAt: FieldValue.serverTimestamp(),
+                updatedAt: FieldValue.serverTimestamp(),
+              });
+            }
+          }
+
+          transaction.update(applicationRef, {
+            applicationStatus: newStatus,
+            reviewedAt: FieldValue.serverTimestamp(),
+          });
+
+          return {
+            applicationStatus: newStatus,
+            paymentProfileCreated:
+              newStatus === "Approved",
+          };
+        }
+      );
+
+      return res.status(200).json({
+        success: true,
+        message:
+          newStatus === "Approved"
+            ? "Application approved and payment profile checked successfully."
+            : "Application rejected successfully.",
+        data: result,
+      });
+    } catch (error) {
+      console.error("Dormitory approval API error:", error);
+
+      return res.status(error.statusCode || 500).json({
+        success: false,
+        message:
+          error.statusCode === 404
+            ? error.message
+            : "Unable to update dormitory application.",
+      });
+    }
+  }
+);
+
+
 // --------------------------------------------------
 // Dormitory Monthly Confirmation API
 // --------------------------------------------------
