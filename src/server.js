@@ -1547,9 +1547,11 @@ app.get(
 );
 
 
-// --------------------------------------------------
-// Payment Management - Assign Student Category API
-// --------------------------------------------------
+
+
+ // --------------------------------------------------
+ // Payment Management - Assign Student Category API
+ // --------------------------------------------------
 
 app.patch(
   "/api/payments/students/:studentId/category",
@@ -1579,10 +1581,12 @@ app.patch(
         "non-school": 200000,
       };
 
-      if (!Object.prototype.hasOwnProperty.call(
-        categoryFees,
-        paymentCategory
-      )) {
+      if (
+        !Object.prototype.hasOwnProperty.call(
+          categoryFees,
+          paymentCategory
+        )
+      ) {
         return res.status(400).json({
           success: false,
           message: "Invalid payment category.",
@@ -1616,40 +1620,147 @@ app.patch(
             throw error;
           }
 
+          const billingStartMonth =
+            profileData.billingStartMonth;
+
+          if (
+            !billingStartMonth ||
+            !/^\d{4}-\d{2}$/.test(billingStartMonth)
+          ) {
+            const error = new Error(
+              "Invalid billing start month."
+            );
+            error.statusCode = 400;
+            throw error;
+          }
+
+          const currentMonth = getMyanmarMonth();
+          const lastChargeMonth =
+            profileData.lastChargeMonth || null;
+
+          const endMonth =
+            lastChargeMonth &&
+            lastChargeMonth < currentMonth
+              ? lastChargeMonth
+              : currentMonth;
+
+          const months = [];
+          let [year, month] =
+            billingStartMonth.split("-").map(Number);
+
+          while (true) {
+            const billingMonth =
+              `${year}-${String(month).padStart(2, "0")}`;
+
+            if (billingMonth > endMonth) break;
+
+            months.push(billingMonth);
+
+            month++;
+
+            if (month > 12) {
+              month = 1;
+              year++;
+            }
+
+           if (months.length > 499) {
+              const error = new Error(
+                "Billing period is too long. Please contact support."
+              );
+              error.statusCode = 400;
+              throw error;
+            }
+          }
+
+          const monthlyFee = categoryFees[paymentCategory];
+
+          const paymentRecordsCollection =
+            firestore.collection("paymentRecords");
+
+          const recordRefs = months.map((billingMonth) =>
+            paymentRecordsCollection.doc(
+              `${studentId}_${billingMonth}`
+            )
+          );
+
+          // Read all existing records before writing.
+          const recordSnapshots = [];
+
+          for (const recordRef of recordRefs) {
+            recordSnapshots.push(
+              await transaction.get(recordRef)
+            );
+          }
+
+          let createdRecords = 0;
+
           transaction.update(profileRef, {
             paymentCategory,
-            monthlyFee: categoryFees[paymentCategory],
+            monthlyFee,
             updatedAt: FieldValue.serverTimestamp(),
           });
+
+          for (let i = 0; i < months.length; i++) {
+            if (recordSnapshots[i].exists) {
+              continue;
+            }
+
+            const billingMonth = months[i];
+            const recordRef = recordRefs[i];
+
+            transaction.create(recordRef, {
+              studentId,
+              studentName: profileData.studentName || "",
+              dormitoryNumber:
+                profileData.dormitoryNumber || "",
+              billingMonth,
+              monthlyFee,
+              paidAmount: 0,
+              balance: monthlyFee,
+              status: "Unpaid",
+              createdAt: FieldValue.serverTimestamp(),
+              updatedAt: FieldValue.serverTimestamp(),
+            });
+
+            createdRecords++;
+          }
 
           return {
             studentId,
             paymentCategory,
-            monthlyFee: categoryFees[paymentCategory],
+            monthlyFee,
+            billingStartMonth,
+            currentMonth,
+            createdRecords,
+            totalBillingMonths: months.length,
           };
         }
       );
 
       return res.status(200).json({
         success: true,
-        message: "Payment category updated successfully.",
+        message:
+          "Payment category updated and monthly debts generated successfully.",
         data: result,
       });
     } catch (error) {
-      console.error("Payment category update error:", error);
+      console.error(
+        "Payment category update error:",
+        error
+      );
 
       return res.status(error.statusCode || 500).json({
         success: false,
         message:
-          error.statusCode === 404
+          error.statusCode === 404 ||
+          error.statusCode === 400
             ? error.message
-            : error.statusCode === 400
-              ? error.message
-              : "Unable to update payment category.",
+            : "Unable to update payment category.",
       });
     }
   }
 );
+
 
 
 // --------------------------------------------------
