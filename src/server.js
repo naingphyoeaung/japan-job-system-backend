@@ -1490,6 +1490,7 @@ app.patch(
 );
 
 
+
 // --------------------------------------------------
 // Payment Management - Student List API
 // --------------------------------------------------
@@ -1507,6 +1508,13 @@ app.get(
         });
       }
 
+      const currentMonth = getMyanmarMonth();
+
+      const categoryFees = {
+        school: 300000,
+        "non-school": 200000,
+      };
+
       const snapshot = await firestore
         .collection("paymentProfiles")
         .get();
@@ -1514,16 +1522,91 @@ app.get(
       const students = snapshot.docs.map((doc) => {
         const data = doc.data();
 
+        const history = Array.isArray(
+          data.paymentCategoryHistory
+        )
+          ? [...data.paymentCategoryHistory]
+          : [];
+
+        const validHistory = history
+          .filter((entry) => {
+            return (
+              entry &&
+              typeof entry.effectiveMonth === "string" &&
+              /^\d{4}-(0[1-9]|1[0-2])$/.test(
+                entry.effectiveMonth
+              ) &&
+              Object.prototype.hasOwnProperty.call(
+                categoryFees,
+                entry.paymentCategory
+              )
+            );
+          })
+          .sort((a, b) =>
+            a.effectiveMonth.localeCompare(b.effectiveMonth)
+          );
+
+        // Find the category effective in the current month.
+        const currentChanges = validHistory.filter(
+          (entry) =>
+            entry.effectiveMonth <= currentMonth
+        );
+
+        const latestCurrentChange =
+          currentChanges.length > 0
+            ? currentChanges[currentChanges.length - 1]
+            : null;
+
+        const currentCategory = latestCurrentChange
+          ? latestCurrentChange.paymentCategory
+          : data.paymentCategory || null;
+
+        const currentFee = currentCategory
+          ? categoryFees[currentCategory] ??
+            data.monthlyFee ??
+            null
+          : null;
+
+        // Find the nearest future scheduled category.
+        const upcomingChange =
+          validHistory.find(
+            (entry) =>
+              entry.effectiveMonth > currentMonth
+          ) || null;
+
         return {
           studentId: doc.id,
           studentName: data.studentName || "",
           dormitoryNumber: data.dormitoryNumber || "",
-          paymentCategory: data.paymentCategory || null,
-          monthlyFee: data.monthlyFee ?? null,
-          billingStartMonth: data.billingStartMonth || "",
-          lastChargeMonth: data.lastChargeMonth || null,
-          checkOutDate: data.checkOutDate || null,
+
+          paymentCategory: currentCategory,
+          monthlyFee: currentFee,
+
+          billingStartMonth:
+            data.billingStartMonth || "",
+
+          lastChargeMonth:
+            data.lastChargeMonth || null,
+
+          checkOutDate:
+            data.checkOutDate || null,
+
           status: data.status || "Active",
+
+          categoryHistory: validHistory,
+
+          upcomingCategory:
+            upcomingChange?.paymentCategory || null,
+
+          upcomingMonthlyFee:
+            upcomingChange
+              ? categoryFees[
+                  upcomingChange.paymentCategory
+                ]
+              : null,
+
+          upcomingEffectiveMonth:
+            upcomingChange?.effectiveMonth || null,
         };
       });
 
@@ -1533,10 +1616,14 @@ app.get(
 
       return res.status(200).json({
         success: true,
+        currentMonth,
         data: students,
       });
     } catch (error) {
-      console.error("Payment student list error:", error);
+      console.error(
+        "Payment student list error:",
+        error
+      );
 
       return res.status(500).json({
         success: false,
@@ -1549,9 +1636,15 @@ app.get(
 
 
 
+
+
  // --------------------------------------------------
  // Payment Management - Assign Student Category API
  // --------------------------------------------------
+
+// --------------------------------------------------
+// Payment Management - Schedule Student Category API
+// --------------------------------------------------
 
 app.patch(
   "/api/payments/students/:studentId/category",
@@ -1567,7 +1660,7 @@ app.patch(
       }
 
       const { studentId } = req.params;
-      const { paymentCategory } = req.body || {};
+      const { paymentCategory, effectiveMonth } = req.body || {};
 
       if (!studentId || studentId.includes("/")) {
         return res.status(400).json({
@@ -1590,6 +1683,25 @@ app.patch(
         return res.status(400).json({
           success: false,
           message: "Invalid payment category.",
+        });
+      }
+
+      if (
+        typeof effectiveMonth !== "string" ||
+        !/^\d{4}-(0[1-9]|1[0-2])$/.test(effectiveMonth)
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid effective month. Use YYYY-MM.",
+        });
+      }
+
+      const currentMonth = getMyanmarMonth();
+
+      if (effectiveMonth < currentMonth) {
+        return res.status(400).json({
+          success: false,
+          message: "Effective month cannot be in the past.",
         });
       }
 
@@ -1625,7 +1737,7 @@ app.patch(
 
           if (
             !billingStartMonth ||
-            !/^\d{4}-\d{2}$/.test(billingStartMonth)
+            !/^\d{4}-(0[1-9]|1[0-2])$/.test(billingStartMonth)
           ) {
             const error = new Error(
               "Invalid billing start month."
@@ -1634,105 +1746,69 @@ app.patch(
             throw error;
           }
 
-          const currentMonth = getMyanmarMonth();
+          if (effectiveMonth < billingStartMonth) {
+            const error = new Error(
+              "Effective month cannot be before the billing start month."
+            );
+            error.statusCode = 400;
+            throw error;
+          }
+
           const lastChargeMonth =
             profileData.lastChargeMonth || null;
 
-          const endMonth =
+          if (
             lastChargeMonth &&
-            lastChargeMonth < currentMonth
-              ? lastChargeMonth
-              : currentMonth;
-
-          const months = [];
-          let [year, month] =
-            billingStartMonth.split("-").map(Number);
-
-          while (true) {
-            const billingMonth =
-              `${year}-${String(month).padStart(2, "0")}`;
-
-            if (billingMonth > endMonth) break;
-
-            months.push(billingMonth);
-
-            month++;
-
-            if (month > 12) {
-              month = 1;
-              year++;
-            }
-
-           if (months.length > 499) {
-              const error = new Error(
-                "Billing period is too long. Please contact support."
-              );
-              error.statusCode = 400;
-              throw error;
-            }
+            effectiveMonth > lastChargeMonth
+          ) {
+            const error = new Error(
+              "Effective month cannot be after the last charge month."
+            );
+            error.statusCode = 400;
+            throw error;
           }
 
-          const monthlyFee = categoryFees[paymentCategory];
+          const categoryHistory = Array.isArray(
+            profileData.paymentCategoryHistory
+          )
+            ? [...profileData.paymentCategoryHistory]
+            : [];
 
-          const paymentRecordsCollection =
-            firestore.collection("paymentRecords");
+          const newEntry = {
+            effectiveMonth,
+            paymentCategory,
+            monthlyFee: categoryFees[paymentCategory],
+            scheduledAt: new Date().toISOString(),
+          };
 
-          const recordRefs = months.map((billingMonth) =>
-            paymentRecordsCollection.doc(
-              `${studentId}_${billingMonth}`
-            )
+          // Replace the entry if the same effective month already exists.
+          const existingIndex = categoryHistory.findIndex(
+            (entry) =>
+              entry &&
+              entry.effectiveMonth === effectiveMonth
           );
 
-          // Read all existing records before writing.
-          const recordSnapshots = [];
-
-          for (const recordRef of recordRefs) {
-            recordSnapshots.push(
-              await transaction.get(recordRef)
-            );
+          if (existingIndex >= 0) {
+            categoryHistory[existingIndex] = newEntry;
+          } else {
+            categoryHistory.push(newEntry);
           }
 
-          let createdRecords = 0;
+          categoryHistory.sort((a, b) =>
+            a.effectiveMonth.localeCompare(b.effectiveMonth)
+          );
 
           transaction.update(profileRef, {
-            paymentCategory,
-            monthlyFee,
+            paymentCategoryHistory: categoryHistory,
             updatedAt: FieldValue.serverTimestamp(),
           });
-
-          for (let i = 0; i < months.length; i++) {
-            if (recordSnapshots[i].exists) {
-              continue;
-            }
-
-            const billingMonth = months[i];
-            const recordRef = recordRefs[i];
-
-            transaction.create(recordRef, {
-              studentId,
-              studentName: profileData.studentName || "",
-              dormitoryNumber:
-                profileData.dormitoryNumber || "",
-              billingMonth,
-              monthlyFee,
-              paidAmount: 0,
-              balance: monthlyFee,
-              status: "Unpaid",
-              createdAt: FieldValue.serverTimestamp(),
-              updatedAt: FieldValue.serverTimestamp(),
-            });
-
-            createdRecords++;
-          }
 
           return {
             studentId,
             paymentCategory,
-            monthlyFee,
-            billingStartMonth,
-            currentMonth,
-            createdRecords,
-            totalBillingMonths: months.length,
+            monthlyFee: categoryFees[paymentCategory],
+            effectiveMonth,
+            paymentCategoryHistory: categoryHistory,
           };
         }
       );
@@ -1740,12 +1816,12 @@ app.patch(
       return res.status(200).json({
         success: true,
         message:
-          "Payment category updated and monthly debts generated successfully.",
+          "Payment category scheduled successfully. Existing payment records were not changed.",
         data: result,
       });
     } catch (error) {
       console.error(
-        "Payment category update error:",
+        "Payment category scheduling error:",
         error
       );
 
@@ -1755,7 +1831,7 @@ app.patch(
           error.statusCode === 404 ||
           error.statusCode === 400
             ? error.message
-            : "Unable to update payment category.",
+            : "Unable to schedule payment category.",
       });
     }
   }

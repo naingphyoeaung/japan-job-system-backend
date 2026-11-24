@@ -32,6 +32,11 @@ const app = initializeApp({
 
 const firestore = getFirestore(app);
 
+const CATEGORY_FEES = {
+  school: 300000,
+  "non-school": 200000,
+};
+
 function getMyanmarMonth() {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Yangon",
@@ -43,6 +48,13 @@ function getMyanmarMonth() {
   const month = parts.find((p) => p.type === "month").value;
 
   return `${year}-${month}`;
+}
+
+function isValidMonth(value) {
+  return (
+    typeof value === "string" &&
+    /^\d{4}-(0[1-9]|1[0-2])$/.test(value)
+  );
 }
 
 function getBillingMonths(startMonth, endMonth) {
@@ -72,6 +84,62 @@ function getBillingMonths(startMonth, endMonth) {
   return months;
 }
 
+// Select the category applicable to a specific billing month.
+function getCategoryForMonth(profile, billingMonth) {
+  const history = Array.isArray(
+    profile.paymentCategoryHistory
+  )
+    ? profile.paymentCategoryHistory
+    : [];
+
+  const applicableChanges = history
+    .filter((entry) => {
+      return (
+        entry &&
+        isValidMonth(entry.effectiveMonth) &&
+        entry.effectiveMonth <= billingMonth &&
+        Object.prototype.hasOwnProperty.call(
+          CATEGORY_FEES,
+          entry.paymentCategory
+        )
+      );
+    })
+    .sort((a, b) =>
+      a.effectiveMonth.localeCompare(b.effectiveMonth)
+    );
+
+  // The latest scheduled category takes priority.
+  if (applicableChanges.length > 0) {
+    const latestChange =
+      applicableChanges[applicableChanges.length - 1];
+
+    return {
+      paymentCategory: latestChange.paymentCategory,
+      monthlyFee: CATEGORY_FEES[
+        latestChange.paymentCategory
+      ],
+    };
+  }
+
+  // Otherwise, use the original profile category.
+  if (
+    Object.prototype.hasOwnProperty.call(
+      CATEGORY_FEES,
+      profile.paymentCategory
+    )
+  ) {
+    return {
+      paymentCategory: profile.paymentCategory,
+      monthlyFee: CATEGORY_FEES[
+        profile.paymentCategory
+      ],
+    };
+  }
+
+  // No category is applicable for this month.
+  return null;
+}
+
 async function generateMonthlyBilling() {
   const currentMonth = getMyanmarMonth();
 
@@ -92,30 +160,32 @@ async function generateMonthlyBilling() {
 
   for (const profileDoc of profilesSnapshot.docs) {
     const profile = profileDoc.data();
-
     const studentId = profileDoc.id;
-    const monthlyFee = profile.monthlyFee;
-    const category = profile.paymentCategory;
     const startMonth = profile.billingStartMonth;
 
-    if (
-      !category ||
-      !Number.isFinite(monthlyFee) ||
-      monthlyFee <= 0 ||
-      !startMonth ||
-      !/^\d{4}-(0[1-9]|1[0-2])$/.test(startMonth)
-    ) {
+    if (!isValidMonth(startMonth)) {
       skippedCount++;
+
+      console.warn(
+        `Invalid billing start month: ${studentId}`
+      );
+
       continue;
     }
 
-    const lastChargeMonth = profile.lastChargeMonth || null;
+    const lastChargeMonth =
+      profile.lastChargeMonth || null;
 
     if (
       lastChargeMonth &&
-      !/^\d{4}-(0[1-9]|1[0-2])$/.test(lastChargeMonth)
+      !isValidMonth(lastChargeMonth)
     ) {
       skippedCount++;
+
+      console.warn(
+        `Invalid last charge month: ${studentId}`
+      );
+
       continue;
     }
 
@@ -129,9 +199,33 @@ async function generateMonthlyBilling() {
       continue;
     }
 
-    const months = getBillingMonths(startMonth, endMonth);
+    const months = getBillingMonths(
+      startMonth,
+      endMonth
+    );
 
     for (const billingMonth of months) {
+      const categoryData = getCategoryForMonth(
+        profile,
+        billingMonth
+      );
+
+      // Skip months without an assigned category.
+      if (!categoryData) {
+        skippedCount++;
+
+        console.log(
+          `No category assigned: ${studentId} ${billingMonth}`
+        );
+
+        continue;
+      }
+
+      const {
+        paymentCategory,
+        monthlyFee,
+      } = categoryData;
+
       const recordRef = firestore
         .collection("paymentRecords")
         .doc(`${studentId}_${billingMonth}`);
@@ -142,6 +236,7 @@ async function generateMonthlyBilling() {
           studentName: profile.studentName || "",
           dormitoryNumber: profile.dormitoryNumber || "",
           billingMonth,
+          paymentCategory,
           monthlyFee,
           paidAmount: 0,
           balance: monthlyFee,
@@ -151,6 +246,10 @@ async function generateMonthlyBilling() {
         })
         .then(() => {
           createdCount++;
+
+          console.log(
+            `Created: ${studentId} ${billingMonth} ${paymentCategory} ${monthlyFee}`
+          );
         })
         .catch((error) => {
           if (
@@ -162,6 +261,7 @@ async function generateMonthlyBilling() {
           }
 
           failedCount++;
+
           console.error(
             `Failed: ${studentId} ${billingMonth}`,
             error.message
@@ -176,6 +276,7 @@ async function generateMonthlyBilling() {
   await Promise.all(writeTasks);
 
   console.log("Monthly billing completed.");
+
   console.log({
     currentMonth,
     activeProfiles: profilesSnapshot.size,
