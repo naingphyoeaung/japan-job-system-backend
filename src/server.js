@@ -2525,6 +2525,128 @@ app.patch(
 );
 
 // --------------------------------------------------
+
+// --------------------------------------------------
+// JOB STUDENT REGISTRATION API
+// Sequential KB ID Allocation
+// --------------------------------------------------
+
+async function createJobStudentApplication(req, res) {
+  try {
+    if (!firebaseAdminReady || !firestore) {
+      return res.status(503).json({
+        success: false,
+        message: "Registration service is unavailable.",
+      });
+    }
+
+    const applicationData = req.body?.applicationData;
+
+    if (
+      !applicationData ||
+      typeof applicationData !== "object" ||
+      Array.isArray(applicationData)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid application data.",
+      });
+    }
+
+    const counterRef = firestore
+      .collection("systemCounters")
+      .doc("jobStudentApplication");
+
+    const applicationRef = firestore
+      .collection("jobStudentApplications")
+      .doc();
+
+    const result = await firestore.runTransaction(
+      async (transaction) => {
+        const counterSnapshot = await transaction.get(counterRef);
+
+        if (!counterSnapshot.exists) {
+          throw new Error("COUNTER_NOT_INITIALIZED");
+        }
+
+        const currentValue = counterSnapshot.data()?.value;
+
+        if (
+          !Number.isSafeInteger(currentValue) ||
+          currentValue < 0
+        ) {
+          throw new Error("INVALID_COUNTER_VALUE");
+        }
+
+        const nextValue = currentValue + 1;
+
+        const studentId =
+          `KB${String(nextValue).padStart(7, "0")}`;
+
+        const newApplication = {
+          ...applicationData,
+          id: studentId,
+          applicationStatus: "Pending",
+          submittedAt: new Date().toISOString(),
+        };
+
+        delete newApplication.notificationSentAt;
+        delete newApplication.firestoreId;
+
+        transaction.create(applicationRef, newApplication);
+
+        transaction.update(counterRef, {
+          value: nextValue,
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+
+        return {
+          studentId,
+          applicationId: applicationRef.id,
+        };
+      }
+    );
+
+    return res.status(201).json({
+      success: true,
+      ...result,
+    });
+
+  } catch (error) {
+    if (
+      error.message === "COUNTER_NOT_INITIALIZED" ||
+      error.message === "INVALID_COUNTER_VALUE"
+    ) {
+      return res.status(503).json({
+        success: false,
+        message: "Application ID counter is not ready.",
+      });
+    }
+
+    console.error("Job student registration error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Unable to save the application.",
+    });
+  }
+}
+
+// Public registration: App Check protected
+app.post(
+  "/api/public/job-student-applications",
+  verifyAppCheckToken,
+  createJobStudentApplication
+);
+
+// Admin registration: Firebase Auth + Admin/Teacher role
+app.post(
+  "/api/admin/job-student-applications",
+  verifyFirebaseToken,
+  requireAdminOrTeacher,
+  createJobStudentApplication
+);
+
 // Start Server
 // --------------------------------------------------
 
