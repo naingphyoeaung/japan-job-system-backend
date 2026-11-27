@@ -5,6 +5,8 @@ import dotenv from "dotenv";
 import multer from "multer";
 import {
   randomUUID,
+  randomInt,
+  randomBytes,
   createHmac,
   timingSafeEqual,
   createHash,
@@ -13,6 +15,8 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { createClient } from "@supabase/supabase-js";
 import { google } from "googleapis";
+import nodemailer from "nodemailer";
+import { rateLimit } from "express-rate-limit";
 import {
   initializeApp,
   cert,
@@ -30,11 +34,30 @@ import { getAppCheck } from "firebase-admin/app-check";
 dotenv.config();
 
 const app = express();
+app.set("trust proxy", 1);
 const PORT = process.env.PORT || 8080;
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
 const IMAGE_CLEANUP_SECRET = process.env.IMAGE_CLEANUP_SECRET;
+const EMAIL_OTP_SECRET = process.env.EMAIL_OTP_SECRET;
+
+// --------------------------------------------------
+// Email OTP - Gmail SMTP
+// --------------------------------------------------
+
+const emailTransporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST || "smtp.gmail.com",
+  port: Number(process.env.SMTP_PORT || 465),
+  secure: process.env.SMTP_SECURE !== "false",
+  auth: {
+    user: process.env.SMTP_EMAIL,
+    pass: process.env.SMTP_APP_PASSWORD?.replace(/\s/g, ""),
+  },
+});
+
+const OTP_EMAIL_SENDER =
+  process.env.SMTP_EMAIL;
 
 const ALLOWED_IMAGE_BUCKETS = [
   "student-photos",
@@ -197,7 +220,7 @@ async function verifyFirebaseToken(req, res, next) {
   tokenType: typeof authorization.match(/^Bearer (.+)$/i)?.[1],
   tokenParts:
     authorization.match(/^Bearer (.+)$/i)?.[1]?.split(".").length,
-}); 
+});
 
     return res.status(401).json({
       success: false,
@@ -262,6 +285,361 @@ function requireAdminOrTeacher(req, res, next) {
 
   return next();
 }
+
+
+// ==========================================
+// EMAIL OTP VERIFICATION
+// ==========================================
+
+const OTP_COLLECTION = "emailOtpChallenges";
+const OTP_VERIFICATION_COLLECTION = "emailOtpVerifications";
+
+const OTP_EXPIRES_MS = 5 * 60 * 1000;
+const OTP_RESEND_MS = 60 * 1000;
+const OTP_MAX_ATTEMPTS = 5;
+
+function normalizeEmail(email) {
+  return typeof email === "string"
+    ? email.trim().toLowerCase()
+    : "";
+}
+
+function hashOtp(value) {
+  return createHmac("sha256", EMAIL_OTP_SECRET)
+    .update(value)
+    .digest("hex");
+}
+
+function safeHashCompare(a, b) {
+  if (
+    typeof a !== "string" ||
+    typeof b !== "string" ||
+    !/^[a-f0-9]{64}$/i.test(a) ||
+    !/^[a-f0-9]{64}$/i.test(b)
+  ) {
+    return false;
+  }
+
+  const first = Buffer.from(a, "hex");
+  const second = Buffer.from(b, "hex");
+
+  return timingSafeEqual(first, second);
+}
+
+function isValidEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function getOtpScope(req) {
+  return req.authUser?.uid || "public";
+}
+
+function getOtpDocumentId(scope, email) {
+  return createHash("sha256")
+    .update(`${scope}:${email}`)
+    .digest("hex");
+}
+
+// Send OTP
+async function sendEmailOtp(req, res) {
+  try {
+    if (
+      !firebaseAdminReady ||
+      !firestore ||
+      !EMAIL_OTP_SECRET ||
+      !process.env.SMTP_EMAIL ||
+      !process.env.SMTP_APP_PASSWORD
+    ) {
+      return res.status(503).json({
+        success: false,
+        message: "Email verification service is unavailable.",
+      });
+    }
+
+    const email = normalizeEmail(req.body?.email);
+
+    if (!isValidEmail(email)) {
+      return res.status(400).json({
+        success: false,
+        message: "Please enter a valid email address.",
+      });
+    }
+
+    const scope = getOtpScope(req);
+    const documentId = getOtpDocumentId(scope, email);
+    const challengeRef = firestore
+      .collection(OTP_COLLECTION)
+      .doc(documentId);
+
+    const now = Date.now();
+    const otp = String(randomInt(0, 1000000)).padStart(6, "0");
+    const otpHash = hashOtp(`${scope}:${email}:${otp}`);
+
+    const allowed = await firestore.runTransaction(
+      async (transaction) => {
+        const snapshot = await transaction.get(challengeRef);
+
+        if (snapshot.exists) {
+          const data = snapshot.data();
+
+          if (
+            data.lastSentAt &&
+            now - data.lastSentAt < OTP_RESEND_MS
+          ) {
+            return false;
+          }
+        }
+
+        transaction.set(challengeRef, {
+          email,
+          scope,
+          otpHash,
+          attempts: 0,
+          createdAt: now,
+          expiresAt: now + OTP_EXPIRES_MS,
+          lastSentAt: now,
+        });
+
+        return true;
+      }
+    );
+
+    if (!allowed) {
+      return res.status(429).json({
+        success: false,
+        message: "Please wait before requesting another code.",
+      });
+    }
+
+    try {
+      await emailTransporter.sendMail({
+        from: OTP_EMAIL_SENDER,
+        to: email,
+        subject: "KIBO Registration Email Verification",
+        text:
+          `Your verification code is ${otp}. ` +
+          "This code expires in 5 minutes. Do not share it with anyone.",
+        html: `
+          <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:24px">
+            <h2>KIBO Language School</h2>
+            <p>Your email verification code is:</p>
+            <div style="font-size:32px;font-weight:bold;letter-spacing:8px;padding:16px 0">
+              ${otp}
+            </div>
+            <p>This code expires in 5 minutes.</p>
+            <p>Please do not share this code with anyone.</p>
+          </div>
+        `,
+      });
+        } catch (mailError) {
+      await firestore.runTransaction(async (transaction) => {
+        const snapshot = await transaction.get(challengeRef);
+
+        if (
+          snapshot.exists &&
+          snapshot.data().otpHash === otpHash
+        ) {
+          transaction.delete(challengeRef);
+        }
+      });
+
+      console.error("OTP email delivery failed:", mailError.message);
+
+      return res.status(502).json({
+        success: false,
+        message: "Unable to send verification email.",
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: "Verification code sent.",
+    });
+  } catch (error) {
+    console.error("Send email OTP error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Unable to send verification code.",
+    });
+  }
+}
+
+// Verify OTP
+async function verifyEmailOtp(req, res) {
+  try {
+    if (
+      !firebaseAdminReady ||
+      !firestore ||
+      !EMAIL_OTP_SECRET
+    ) {
+      return res.status(503).json({
+        success: false,
+        message: "Email verification service is unavailable.",
+      });
+    }
+
+    const email = normalizeEmail(req.body?.email);
+    const otp = String(req.body?.otp || "").trim();
+
+    if (!isValidEmail(email) || !/^\d{6}$/.test(otp)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid email or verification code.",
+      });
+    }
+
+    const scope = getOtpScope(req);
+    const documentId = getOtpDocumentId(scope, email);
+
+    const challengeRef = firestore
+      .collection(OTP_COLLECTION)
+      .doc(documentId);
+
+    const verificationToken = randomBytes(32).toString("hex");
+
+const verificationDocumentId = createHash("sha256")
+  .update(verificationToken)
+  .digest("hex");
+
+const verificationRef = firestore
+  .collection(OTP_VERIFICATION_COLLECTION)
+  .doc(verificationDocumentId);
+
+    const result = await firestore.runTransaction(
+      async (transaction) => {
+        const snapshot = await transaction.get(challengeRef);
+
+        if (!snapshot.exists) {
+          return { status: "NOT_FOUND" };
+        }
+
+        const data = snapshot.data();
+
+        if (Date.now() > data.expiresAt) {
+          transaction.delete(challengeRef);
+          return { status: "EXPIRED" };
+        }
+
+        if (data.attempts >= OTP_MAX_ATTEMPTS) {
+          transaction.delete(challengeRef);
+          return { status: "LOCKED" };
+        }
+
+        const submittedHash = hashOtp(
+          `${scope}:${email}:${otp}`
+        );
+
+        if (!safeHashCompare(data.otpHash, submittedHash)) {
+          transaction.update(challengeRef, {
+            attempts: data.attempts + 1,
+          });
+
+          return { status: "INVALID" };
+        }
+
+        transaction.delete(challengeRef);
+
+        transaction.create(verificationRef, {
+          email,
+          scope,
+          tokenHash: hashOtp(
+            `verification:${scope}:${email}:${verificationToken}`
+          ),
+          createdAt: Date.now(),
+          expiresAt: Date.now() + 10 * 60 * 1000,
+          used: false,
+        });
+
+        return {
+          status: "VERIFIED",
+          verificationToken,
+        };
+      }
+    );
+
+    if (result.status !== "VERIFIED") {
+      const messages = {
+        NOT_FOUND: "Please request a verification code first.",
+        EXPIRED: "Verification code has expired.",
+        LOCKED: "Too many incorrect attempts. Request a new code.",
+        INVALID: "Incorrect verification code.",
+      };
+
+      return res.status(400).json({
+        success: false,
+        message: messages[result.status],
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: "Email verified successfully.",
+      verificationToken: result.verificationToken,
+    });
+  } catch (error) {
+    console.error("Verify email OTP error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Unable to verify email.",
+    });
+  }
+}
+
+// PUBLIC OTP RATE LIMITERS
+const publicOtpSendLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: "Too many OTP requests. Please try again later.",
+  },
+});
+
+const publicOtpVerifyLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: "Too many verification attempts. Please try again later.",
+  },
+});
+
+// Public OTP APIs
+app.post(
+  "/api/public/email-otp/send",
+  publicOtpSendLimiter,
+  verifyAppCheckToken,
+  sendEmailOtp
+);
+
+app.post(
+  "/api/public/email-otp/verify",
+  publicOtpVerifyLimiter,
+  verifyAppCheckToken,
+  verifyEmailOtp
+);
+
+// Admin OTP APIs
+app.post(
+  "/api/admin/email-otp/send",
+  verifyFirebaseToken,
+  requireAdminOrTeacher,
+  sendEmailOtp
+);
+
+app.post(
+  "/api/admin/email-otp/verify",
+  verifyFirebaseToken,
+  requireAdminOrTeacher,
+  verifyEmailOtp
+);
+
 
 // ==========================================
 // GET USERS BY FIREBASE CUSTOM CLAIMS ROLE
@@ -1220,7 +1598,7 @@ const normalizeNrc = (value) =>
     )
     .replace(/\s+/g, "")
     .toUpperCase();
-    
+
 console.log("DORMITORY REGISTRATION ROUTE LOADED");
 app.post("/api/dormitory/register", async (req, res) => {
   try {
@@ -2323,7 +2701,7 @@ app.get(
           });
 
           if (columnIsRed) {
-            holidayDates.add(String(date).trim());  
+            holidayDates.add(String(date).trim());
           }
         });
 
@@ -2553,6 +2931,43 @@ async function createJobStudentApplication(req, res) {
       });
     }
 
+if (!EMAIL_OTP_SECRET) {
+  return res.status(503).json({
+    success: false,
+    message: "Email verification service is unavailable.",
+  });
+}
+
+        // ------------------------------------------
+    // EMAIL OTP VERIFICATION
+    // ------------------------------------------
+
+
+
+    const email = normalizeEmail(applicationData.email);
+    const verificationToken = req.body?.verificationToken;
+
+    if (
+      !isValidEmail(email) ||
+      typeof verificationToken !== "string" ||
+      !/^[a-f0-9]{64}$/i.test(verificationToken)
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: "Please verify your email before submitting.",
+      });
+    }
+
+    const scope = getOtpScope(req);
+
+    const verificationDocumentId = createHash("sha256")
+      .update(verificationToken)
+      .digest("hex");
+
+    const verificationRef = firestore
+      .collection(OTP_VERIFICATION_COLLECTION)
+      .doc(verificationDocumentId);
+
     const counterRef = firestore
       .collection("systemCounters")
       .doc("jobStudentApplication");
@@ -2561,10 +2976,52 @@ async function createJobStudentApplication(req, res) {
       .collection("jobStudentApplications")
       .doc();
 
+
     const result = await firestore.runTransaction(
       async (transaction) => {
-        const counterSnapshot = await transaction.get(counterRef);
+        // Read both documents first
+        const [counterSnapshot, verificationSnapshot] =
+          await Promise.all([
+            transaction.get(counterRef),
+            transaction.get(verificationRef),
+          ]);
 
+        // Verify email token
+        if (!verificationSnapshot.exists) {
+          throw new Error("EMAIL_NOT_VERIFIED");
+        }
+
+        const verificationData = verificationSnapshot.data();
+
+        if (
+          verificationData.email !== email ||
+          verificationData.scope !== scope ||
+          verificationData.used === true
+        ) {
+          throw new Error("EMAIL_NOT_VERIFIED");
+        }
+
+        if (
+          !verificationData.expiresAt ||
+          Date.now() > verificationData.expiresAt
+        ) {
+          throw new Error("EMAIL_VERIFICATION_EXPIRED");
+        }
+
+        const submittedTokenHash = hashOtp(
+          `verification:${scope}:${email}:${verificationToken}`
+        );
+
+        if (
+          !safeHashCompare(
+            verificationData.tokenHash,
+            submittedTokenHash
+          )
+        ) {
+          throw new Error("EMAIL_NOT_VERIFIED");
+        }
+
+        // Check KB ID counter
         if (!counterSnapshot.exists) {
           throw new Error("COUNTER_NOT_INITIALIZED");
         }
@@ -2585,6 +3042,7 @@ async function createJobStudentApplication(req, res) {
 
         const newApplication = {
           ...applicationData,
+          email,
           id: studentId,
           applicationStatus: "Pending",
           submittedAt: new Date().toISOString(),
@@ -2592,6 +3050,9 @@ async function createJobStudentApplication(req, res) {
 
         delete newApplication.notificationSentAt;
         delete newApplication.firestoreId;
+
+        // Consume verification token once
+        transaction.delete(verificationRef);
 
         transaction.create(applicationRef, newApplication);
 
@@ -2607,12 +3068,29 @@ async function createJobStudentApplication(req, res) {
       }
     );
 
+
     return res.status(201).json({
       success: true,
       ...result,
     });
 
+
+
   } catch (error) {
+    if (error.message === "EMAIL_NOT_VERIFIED") {
+      return res.status(403).json({
+        success: false,
+        message: "Please verify your email before submitting.",
+      });
+    }
+
+    if (error.message === "EMAIL_VERIFICATION_EXPIRED") {
+      return res.status(403).json({
+        success: false,
+        message: "Email verification has expired. Please verify again.",
+      });
+    }
+
     if (
       error.message === "COUNTER_NOT_INITIALIZED" ||
       error.message === "INVALID_COUNTER_VALUE"
@@ -2631,6 +3109,7 @@ async function createJobStudentApplication(req, res) {
     });
   }
 }
+
 
 // Public registration: App Check protected
 app.post(
