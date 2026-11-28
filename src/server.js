@@ -2576,6 +2576,224 @@ app.patch(
   }
 );
 
+// ==========================================
+// CREATE PUBLIC JOB STUDENT DRAFT
+// ==========================================
+
+async function createJobStudentDraft(req, res) {
+  try {
+    if (!firebaseAdminReady || !firestore) {
+      return res.status(503).json({
+        success: false,
+        message: "Database is not available.",
+      });
+    }
+
+    const email = normalizeEmail(req.body?.email);
+    const category = req.body?.category;
+    const turnstileToken = req.body?.turnstileToken;
+
+    const allowedCategories = [
+      "Caregiver",
+      "Restaurant",
+      "Factory",
+      "Hotel",
+      "Construction",
+      "Agriculture",
+      "Cleaning",
+      "Industrial Product Manufacturing",
+      "Other",
+    ];
+
+    if (!isValidEmail(email)) {
+      return res.status(400).json({
+        success: false,
+        message: "Please enter a valid email address.",
+      });
+    }
+
+    if (!allowedCategories.includes(category)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid job category.",
+      });
+    }
+
+    const isHuman =
+      await verifyTurnstileToken(turnstileToken);
+
+    if (!isHuman) {
+      return res.status(403).json({
+        success: false,
+        message: "Human verification failed.",
+      });
+    }
+
+    const lockId = createHash("sha256")
+  .update(`${email}::${category}`)
+  .digest("hex");
+
+const lockRef = firestore
+  .collection("jobStudentApplicationLocks")
+  .doc(lockId);
+
+    const counterRef = firestore
+      .collection("systemCounters")
+      .doc("jobStudentApplication");
+
+    const draftRef = firestore
+      .collection("jobStudentDrafts")
+      .doc();
+
+    const pendingQuery = firestore
+      .collection("jobStudentApplications")
+      .where("desiredJob", "==", category);
+
+    const approvedQuery = firestore
+      .collection("jobStudents")
+      .where("desiredJob", "==", category);
+
+    const updateToken = randomUUID();
+
+    const tokenHash = createHash("sha256")
+      .update(updateToken)
+      .digest("hex");
+
+    const result = await firestore.runTransaction(
+      async (transaction) => {
+        const [
+  counterSnapshot,
+  pendingSnapshot,
+  approvedSnapshot,
+  lockSnapshot,
+] = await Promise.all([
+  transaction.get(counterRef),
+  transaction.get(pendingQuery),
+  transaction.get(approvedQuery),
+  transaction.get(lockRef),
+]);
+
+        const duplicatePending =
+          pendingSnapshot.docs.some(
+            (item) =>
+              normalizeEmail(item.data().email) === email
+          );
+
+        const duplicateApproved =
+          approvedSnapshot.docs.some(
+            (item) =>
+              normalizeEmail(item.data().email) === email
+          );
+
+          const existingLockExpiresAt =
+  lockSnapshot.data()?.expiresAt || 0;
+
+const hasActiveLock =
+  lockSnapshot.exists &&
+  Number(existingLockExpiresAt) > Date.now();
+
+if (
+  duplicatePending ||
+  duplicateApproved ||
+  hasActiveLock
+) {
+  throw new Error("DUPLICATE_APPLICATION");
+}
+
+        if (!counterSnapshot.exists) {
+          throw new Error("COUNTER_NOT_INITIALIZED");
+        }
+
+        const currentValue =
+          counterSnapshot.data()?.value;
+
+        if (
+          !Number.isSafeInteger(currentValue) ||
+          currentValue < 0
+        ) {
+          throw new Error("INVALID_COUNTER_VALUE");
+        }
+
+        const nextValue = currentValue + 1;
+
+        const studentId =
+          `KB${String(nextValue).padStart(7, "0")}`;
+
+        const referenceId = `REF-${studentId}`;
+
+        transaction.set(lockRef, {
+  email,
+  desiredJob: category,
+  draftId: draftRef.id,
+  expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
+  createdAt: FieldValue.serverTimestamp(),
+});
+
+        transaction.create(draftRef, {
+          email,
+          desiredJob: category,
+          id: studentId,
+          referenceId,
+          tokenHash,
+          revision: 0,
+          applicationType: "new",
+          status: "Draft",
+          createdAt: FieldValue.serverTimestamp(),
+          expiresAt: new Date(
+            Date.now() + 7 * 24 * 60 * 60 * 1000
+          ).toISOString(),
+        });
+
+        transaction.update(counterRef, {
+          value: nextValue,
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+
+        return {
+          studentId,
+          referenceId,
+          draftId: draftRef.id,
+        };
+      }
+    );
+
+    return res.status(201).json({
+      success: true,
+      ...result,
+      updateToken,
+    });
+
+  } catch (error) {
+    if (error.message === "DUPLICATE_APPLICATION") {
+      return res.status(409).json({
+        success: false,
+        message:
+          "An application with this email and job category already exists.",
+      });
+    }
+
+    if (
+      error.message === "COUNTER_NOT_INITIALIZED" ||
+      error.message === "INVALID_COUNTER_VALUE"
+    ) {
+      return res.status(503).json({
+        success: false,
+        message: "Student ID counter is not configured correctly.",
+      });
+    }
+
+    console.error(
+      "Create job student draft error:",
+      error
+    );
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to create application draft.",
+    });
+  }
+}
+
 // --------------------------------------------------
 
 // --------------------------------------------------
@@ -2583,7 +2801,7 @@ app.patch(
 // Sequential KB ID Allocation
 // --------------------------------------------------
 
-async function createJobStudentApplication(req, res) {
+async function createAdminJobStudentApplication(req, res) {
   try {
     if (!firebaseAdminReady || !firestore) {
       return res.status(503).json({
@@ -2699,12 +2917,768 @@ async function createJobStudentApplication(req, res) {
   }
 }
 
+async function revokeJobStudentDraft(req, res) {
+  try {
+    if (!firebaseAdminReady || !firestore) {
+      return res.status(503).json({
+        success: false,
+        message: "Database is not available.",
+      });
+    }
+
+    const draftId = req.body?.draftId;
+
+    if (
+      typeof draftId !== "string" ||
+      !draftId.trim()
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Valid draft ID is required.",
+      });
+    }
+
+    const draftRef = firestore
+      .collection("jobStudentDrafts")
+      .doc(draftId.trim());
+
+    await firestore.runTransaction(async (transaction) => {
+      const draftSnapshot = await transaction.get(draftRef);
+
+      if (!draftSnapshot.exists) {
+        throw new Error("DRAFT_NOT_FOUND");
+      }
+
+      const draft = draftSnapshot.data();
+
+      if (draft.status === "Revoked") {
+        return;
+      }
+
+      const lockId = createHash("sha256")
+        .update(
+          `${normalizeEmail(draft.email)}::${draft.desiredJob}`
+        )
+        .digest("hex");
+
+      const lockRef = firestore
+        .collection("jobStudentApplicationLocks")
+        .doc(lockId);
+
+      const lockSnapshot = await transaction.get(lockRef);
+
+      transaction.update(draftRef, {
+        status: "Revoked",
+        tokenHash: FieldValue.delete(),
+        revokedAt: FieldValue.serverTimestamp(),
+      });
+
+      if (
+        lockSnapshot.exists &&
+        lockSnapshot.data()?.draftId === draftId.trim()
+      ) {
+        transaction.delete(lockRef);
+      }
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Application refill access has been revoked.",
+    });
+
+  } catch (error) {
+    if (error.message === "DRAFT_NOT_FOUND") {
+      return res.status(404).json({
+        success: false,
+        message: "Application draft was not found.",
+      });
+    }
+
+    console.error("Revoke job student draft error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to revoke application access.",
+    });
+  }
+}
+
+async function lookupPublicJobStudentRefill(req, res) {
+  try {
+    if (!firebaseAdminReady || !firestore) {
+      return res.status(503).json({
+        success: false,
+        message: "Database is not available.",
+      });
+    }
+
+    const referenceId = req.body?.referenceId;
+    const email = normalizeEmail(req.body?.email);
+    const category = req.body?.category;
+    const updateToken = req.body?.updateToken;
+    const xmlRevision = req.body?.revision;
+
+    if (
+      typeof referenceId !== "string" ||
+      !referenceId.trim() ||
+      !isValidEmail(email) ||
+      typeof category !== "string" ||
+      typeof updateToken !== "string" ||
+      !updateToken.trim() ||
+      !Number.isSafeInteger(xmlRevision) ||
+      xmlRevision < 0
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid refill verification data.",
+      });
+    }
+
+    const allowedCategories = [
+      "Caregiver",
+      "Restaurant",
+      "Factory",
+      "Hotel",
+      "Construction",
+      "Agriculture",
+      "Cleaning",
+      "Industrial Product Manufacturing",
+      "Other",
+    ];
+
+    if (!allowedCategories.includes(category)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid job category.",
+      });
+    }
+
+    const draftQuery = await firestore
+      .collection("jobStudentDrafts")
+      .where("referenceId", "==", referenceId.trim())
+      .limit(1)
+      .get();
+
+    if (draftQuery.empty) {
+      return res.status(404).json({
+        success: false,
+        message: "Application reference was not found.",
+      });
+    }
+
+    const draftSnapshot = draftQuery.docs[0];
+    const draft = draftSnapshot.data();
+
+    if (
+      draft.status !== "Submitted" ||
+      !draft.tokenHash ||
+      normalizeEmail(draft.email) !== email ||
+      draft.desiredJob !== category
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: "Application refill access is invalid or revoked.",
+      });
+    }
+
+    const submittedTokenHash = createHash("sha256")
+      .update(updateToken)
+      .digest();
+
+    const storedTokenHash = Buffer.from(
+      draft.tokenHash,
+      "hex"
+    );
+
+    if (
+      storedTokenHash.length !== submittedTokenHash.length ||
+      !timingSafeEqual(
+        storedTokenHash,
+        submittedTokenHash
+      )
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: "Invalid application security token.",
+      });
+    }
+
+    let applicationSnapshot = await firestore
+      .collection("jobStudents")
+      .doc(String(draft.id))
+      .get();
+
+    if (!applicationSnapshot.exists) {
+      const pendingQuery = await firestore
+        .collection("jobStudentApplications")
+        .where("draftId", "==", draftSnapshot.id)
+        .limit(1)
+        .get();
+
+      if (!pendingQuery.empty) {
+        applicationSnapshot = pendingQuery.docs[0];
+      }
+    }
+
+    if (!applicationSnapshot.exists) {
+      return res.status(404).json({
+        success: false,
+        message: "The original application no longer exists.",
+      });
+    }
+
+    const applicationData = applicationSnapshot.data();
+    const currentRevision = Number(
+      applicationData.revision || 0
+    );
+
+    if (currentRevision !== xmlRevision) {
+      return res.status(409).json({
+        success: false,
+        code: "REVISION_CONFLICT",
+        message:
+          "This XML file is outdated. The application has been updated since this file was saved.",
+        currentRevision,
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      referenceId: draft.referenceId,
+      studentId: draft.id,
+      revision: currentRevision,
+      applicationData,
+    });
+
+  } catch (error) {
+    console.error(
+      "Lookup public job student refill error:",
+      error
+    );
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to verify refill application.",
+    });
+  }
+}
+
+async function submitPublicJobStudentRefill(req, res) {
+  try {
+    if (!firebaseAdminReady || !firestore) {
+      return res.status(503).json({
+        success: false,
+        message: "Database is not available.",
+      });
+    }
+
+    const referenceId = req.body?.referenceId;
+    const email = normalizeEmail(req.body?.email);
+    const category = req.body?.category;
+    const updateToken = req.body?.updateToken;
+    const expectedRevision = req.body?.revision;
+    const applicationData = req.body?.applicationData;
+
+    if (
+      typeof referenceId !== "string" ||
+      !referenceId.trim() ||
+      !isValidEmail(email) ||
+      typeof category !== "string" ||
+      typeof updateToken !== "string" ||
+      !updateToken.trim() ||
+      !Number.isSafeInteger(expectedRevision) ||
+      expectedRevision < 0 ||
+      !applicationData ||
+      typeof applicationData !== "object" ||
+      Array.isArray(applicationData)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid refill submission data.",
+      });
+    }
+
+    const allowedCategories = [
+      "Caregiver",
+      "Restaurant",
+      "Factory",
+      "Hotel",
+      "Construction",
+      "Agriculture",
+      "Cleaning",
+      "Industrial Product Manufacturing",
+      "Other",
+    ];
+
+    if (!allowedCategories.includes(category)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid job category.",
+      });
+    }
+
+    if (
+      normalizeEmail(applicationData.email) !== email ||
+      applicationData.desiredJob !== category
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Email or job category does not match.",
+      });
+    }
+
+    const draftQuery = await firestore
+      .collection("jobStudentDrafts")
+      .where("referenceId", "==", referenceId.trim())
+      .limit(1)
+      .get();
+
+    if (draftQuery.empty) {
+      return res.status(404).json({
+        success: false,
+        message: "Application reference was not found.",
+      });
+    }
+
+    const draftSnapshot = draftQuery.docs[0];
+    const draftRef = draftSnapshot.ref;
+
+    const submittedTokenHash = createHash("sha256")
+      .update(updateToken)
+      .digest();
+
+    const storedTokenHash = Buffer.from(
+      draftSnapshot.data().tokenHash || "",
+      "hex"
+    );
+
+    if (
+      storedTokenHash.length !== submittedTokenHash.length ||
+      !timingSafeEqual(
+        storedTokenHash,
+        submittedTokenHash
+      )
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: "Invalid application security token.",
+      });
+    }
+
+    const approvedRef = firestore
+      .collection("jobStudents")
+      .doc(String(draftSnapshot.data().id));
+
+    const pendingQuery = firestore
+      .collection("jobStudentApplications")
+      .where("draftId", "==", draftSnapshot.id)
+      .limit(1);
+
+    const result = await firestore.runTransaction(
+      async (transaction) => {
+        const currentDraftSnapshot =
+          await transaction.get(draftRef);
+
+        if (!currentDraftSnapshot.exists) {
+          throw new Error("DRAFT_NOT_FOUND");
+        }
+
+        const draft = currentDraftSnapshot.data();
+
+        const currentTokenHash = Buffer.from(
+          draft.tokenHash || "",
+          "hex"
+        );
+
+        if (
+          draft.status !== "Submitted" ||
+          normalizeEmail(draft.email) !== email ||
+          draft.desiredJob !== category ||
+          currentTokenHash.length !== submittedTokenHash.length ||
+          !timingSafeEqual(
+            currentTokenHash,
+            submittedTokenHash
+          )
+        ) {
+          throw new Error("INVALID_REFILL_ACCESS");
+        }
+
+        const approvedSnapshot =
+          await transaction.get(approvedRef);
+
+        let targetRef = approvedRef;
+        let targetSnapshot = approvedSnapshot;
+
+        if (!approvedSnapshot.exists) {
+          const pendingSnapshot =
+            await transaction.get(pendingQuery);
+
+          if (pendingSnapshot.empty) {
+            throw new Error("APPLICATION_NOT_FOUND");
+          }
+
+          targetSnapshot = pendingSnapshot.docs[0];
+          targetRef = targetSnapshot.ref;
+        }
+
+        const currentApplication = targetSnapshot.data();
+        const currentRevision = Number(
+          currentApplication.revision || 0
+        );
+
+        if (currentRevision !== expectedRevision) {
+          throw new Error("REVISION_CONFLICT");
+        }
+
+
+const updatedApplication = {
+  ...currentApplication,
+  ...applicationData,
+
+  id: draft.id,
+  draftId: draftRef.id,
+  referenceId: draft.referenceId,
+  email,
+  desiredJob: category,
+
+
+
+  applicationType: "refill",
+  revision: currentRevision + 1,
+  applicationStatus:
+    currentApplication.applicationStatus ||
+    (approvedSnapshot.exists ? "Approved" : "Pending"),
+
+  updatedAt: new Date().toISOString(),
+};
+
+// Preserve original admin-managed fields
+if (
+  Object.prototype.hasOwnProperty.call(
+    currentApplication,
+    "status"
+  )
+) {
+  updatedApplication.status = currentApplication.status;
+} else {
+  delete updatedApplication.status;
+}
+
+if (
+  Object.prototype.hasOwnProperty.call(
+    currentApplication,
+    "createdDate"
+  )
+) {
+  updatedApplication.createdDate =
+    currentApplication.createdDate;
+} else {
+  delete updatedApplication.createdDate;
+}
+
+
+        delete updatedApplication.firestoreId;
+        delete updatedApplication.tokenHash;
+        delete updatedApplication.updateToken;
+        delete updatedApplication.notificationSentAt;
+
+        transaction.set(targetRef, updatedApplication, {
+          merge: false,
+        });
+
+        transaction.update(draftRef, {
+          revision: currentRevision + 1,
+          lastRefilledAt: FieldValue.serverTimestamp(),
+        });
+
+        return {
+          studentId: draft.id,
+          referenceId: draft.referenceId,
+          revision: currentRevision + 1,
+          applicationStatus: updatedApplication.applicationStatus,
+        };
+      }
+    );
+
+    return res.status(200).json({
+      success: true,
+      ...result,
+    });
+
+  } catch (error) {
+    if (error.message === "DRAFT_NOT_FOUND") {
+      return res.status(404).json({
+        success: false,
+        message: "Application draft was not found.",
+      });
+    }
+
+    if (error.message === "APPLICATION_NOT_FOUND") {
+      return res.status(404).json({
+        success: false,
+        message: "The original application no longer exists.",
+      });
+    }
+
+    if (error.message === "INVALID_REFILL_ACCESS") {
+      return res.status(403).json({
+        success: false,
+        message: "Application refill access is invalid or revoked.",
+      });
+    }
+
+    if (error.message === "REVISION_CONFLICT") {
+      return res.status(409).json({
+        success: false,
+        code: "REVISION_CONFLICT",
+        message: "Application data has changed. Please load the latest XML before submitting.",
+      });
+    }
+
+    console.error(
+      "Submit public job student refill error:",
+      error
+    );
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update refill application.",
+    });
+  }
+}
+
+
+async function submitPublicJobStudentApplication(req, res) {
+  try {
+    if (!firebaseAdminReady || !firestore) {
+      return res.status(503).json({
+        success: false,
+        message: "Database is not available.",
+      });
+    }
+
+    const applicationData = req.body?.applicationData;
+    const draftId = req.body?.draftId;
+    const updateToken = req.body?.updateToken;
+
+    if (
+      !applicationData ||
+      typeof applicationData !== "object" ||
+      Array.isArray(applicationData)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid application data.",
+      });
+    }
+
+    if (
+      typeof draftId !== "string" ||
+      !draftId.trim() ||
+      typeof updateToken !== "string" ||
+      !updateToken.trim()
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Application verification is missing.",
+      });
+    }
+
+    const email = normalizeEmail(applicationData.email);
+    const category = applicationData.desiredJob;
+
+    if (!isValidEmail(email)) {
+      return res.status(400).json({
+        success: false,
+        message: "Please enter a valid email address.",
+      });
+    }
+
+    const allowedCategories = [
+      "Caregiver",
+      "Restaurant",
+      "Factory",
+      "Hotel",
+      "Construction",
+      "Agriculture",
+      "Cleaning",
+      "Industrial Product Manufacturing",
+      "Other",
+    ];
+
+    if (!allowedCategories.includes(category)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid job category.",
+      });
+    }
+
+    const draftRef = firestore
+      .collection("jobStudentDrafts")
+      .doc(draftId);
+
+    const lockId = createHash("sha256")
+      .update(`${email}::${category}`)
+      .digest("hex");
+
+    const lockRef = firestore
+      .collection("jobStudentApplicationLocks")
+      .doc(lockId);
+
+    const applicationRef = firestore
+      .collection("jobStudentApplications")
+      .doc();
+
+    const submittedTokenHash = createHash("sha256")
+      .update(updateToken)
+      .digest();
+
+    const result = await firestore.runTransaction(
+      async (transaction) => {
+        const [draftSnapshot, lockSnapshot] =
+          await Promise.all([
+            transaction.get(draftRef),
+            transaction.get(lockRef),
+          ]);
+
+        if (!draftSnapshot.exists || !lockSnapshot.exists) {
+          throw new Error("DRAFT_NOT_FOUND");
+        }
+
+        const draft = draftSnapshot.data();
+        const lock = lockSnapshot.data();
+
+        const storedTokenHash = Buffer.from(
+          draft.tokenHash || "",
+          "hex"
+        );
+
+        if (
+          storedTokenHash.length !== submittedTokenHash.length ||
+          !timingSafeEqual(
+            storedTokenHash,
+            submittedTokenHash
+          )
+        ) {
+          throw new Error("INVALID_UPDATE_TOKEN");
+        }
+
+        if (
+          draft.status !== "Draft" ||
+          lock.draftId !== draftId ||
+          normalizeEmail(draft.email) !== email ||
+          draft.desiredJob !== category ||
+          draft.expiresAt <= new Date().toISOString() ||
+          Number(lock.expiresAt) <= Date.now()
+        ) {
+          throw new Error("DRAFT_EXPIRED_OR_INVALID");
+        }
+
+        const newApplication = {
+  ...applicationData,
+  email,
+  desiredJob: category,
+  id: draft.id,
+  draftId: draftRef.id,
+  referenceId: draft.referenceId,
+  applicationType: "new",
+  revision: draft.revision || 0,
+  applicationStatus: "Pending",
+  submittedAt: new Date().toISOString(),
+};
+
+        delete newApplication.notificationSentAt;
+        delete newApplication.firestoreId;
+        delete newApplication.tokenHash;
+        delete newApplication.updateToken;
+
+        transaction.create(applicationRef, newApplication);
+
+        transaction.update(draftRef, {
+          status: "Submitted",
+          applicationId: applicationRef.id,
+          submittedAt: FieldValue.serverTimestamp(),
+        });
+
+        transaction.update(lockRef, {
+          status: "Submitted",
+          submittedAt: FieldValue.serverTimestamp(),
+          expiresAt: FieldValue.delete(),
+        });
+
+        return {
+          studentId: draft.id,
+          referenceId: draft.referenceId,
+          applicationId: applicationRef.id,
+        };
+      }
+    );
+
+    return res.status(201).json({
+      success: true,
+      ...result,
+    });
+
+  } catch (error) {
+    if (error.message === "DRAFT_NOT_FOUND") {
+      return res.status(404).json({
+        success: false,
+        message: "Application draft was not found.",
+      });
+    }
+
+    if (error.message === "INVALID_UPDATE_TOKEN") {
+      return res.status(403).json({
+        success: false,
+        message: "Invalid application security token.",
+      });
+    }
+
+    if (error.message === "DRAFT_EXPIRED_OR_INVALID") {
+      return res.status(409).json({
+        success: false,
+        message: "Application draft has expired or is no longer valid.",
+      });
+    }
+
+    console.error(
+      "Submit public job student application error:",
+      error
+    );
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to submit application.",
+    });
+  }
+}
+
+// Public job student draft: App Check protected
+app.post(
+  "/api/public/job-student-drafts",
+  verifyAppCheckToken,
+  createJobStudentDraft
+);
+
+// Public refill lookup: App Check protected
+app.post(
+  "/api/public/job-student-refill/lookup",
+  verifyAppCheckToken,
+  lookupPublicJobStudentRefill
+);
+
+// Public refill submit: App Check protected
+app.post(
+  "/api/public/job-student-refill/submit",
+  verifyAppCheckToken,
+  submitPublicJobStudentRefill
+);
 
 // Public registration: App Check protected
 app.post(
   "/api/public/job-student-applications",
   verifyAppCheckToken,
-  createJobStudentApplication
+  submitPublicJobStudentApplication
 );
 
 // Admin registration: Firebase Auth + Admin/Teacher role
@@ -2712,9 +3686,16 @@ app.post(
   "/api/admin/job-student-applications",
   verifyFirebaseToken,
   requireAdminOrTeacher,
-  createJobStudentApplication
+  createAdminJobStudentApplication
 );
 
+// Revoke public application refill access
+app.post(
+  "/api/admin/job-student-drafts/revoke",
+  verifyFirebaseToken,
+  requireAdminOrTeacher,
+  revokeJobStudentDraft
+);
 // Start Server
 // --------------------------------------------------
 
